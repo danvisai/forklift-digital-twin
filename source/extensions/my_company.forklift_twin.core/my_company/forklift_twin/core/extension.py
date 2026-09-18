@@ -1,7 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-NvidiaProprietary
 
+import carb.input
+import omni.appwindow
 import omni.ext
+import omni.kit.app
 import omni.ui as ui
 import omni.usd
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
@@ -43,6 +46,36 @@ ISAAC_ROBOT_UNIT_SCALE = 1.0
 # Measured source bounds converted to meters.  These are used for simple proxy
 # colliders; visual assets keep their exact authored geometry.
 RACK_COLLIDER_SIZE = (3.30, 0.60, 2.00)
+
+# --- Forklift joint control -------------------------------------------------
+#
+# forklift_c's rigged joint names aren't published anywhere we could confirm,
+# so instead of hardcoding paths that might be wrong, control joints are
+# found at runtime by matching keywords against joint prim names under the
+# referenced forklift. UNVERIFIED: run "Inspect Forklift Joints" and check
+# the console -- if a control below doesn't respond, the real joint name
+# likely doesn't contain the keyword we're matching, and these tuples are
+# the place to fix it.
+DRIVE_JOINT_KEYWORDS = ("wheel", "drive")
+STEER_JOINT_KEYWORDS = ("steer",)
+LIFT_JOINT_KEYWORDS = ("lift", "hoist", "mast_prismatic")
+TILT_JOINT_KEYWORDS = ("tilt",)
+
+DRIVE_MAX_ANGULAR_VELOCITY_DEG = 360.0  # deg/s on the wheel spin joint(s)
+STEER_MAX_ANGLE_DEG = 30.0
+STEER_RATE_DEG_PER_SEC = 60.0
+LIFT_MIN_M = 0.0
+LIFT_MAX_M = 2.0
+LIFT_RATE_M_PER_SEC = 0.4
+TILT_MAX_ANGLE_DEG = 10.0
+TILT_RATE_DEG_PER_SEC = 15.0
+
+# Starting-point PhysX joint drive gains (kg/m/s^2 scale, i.e. USD Physics
+# drive units). Untuned -- if the forklift moves too stiffly/limply once
+# under real physics, adjust these before touching the keyboard-mapping code.
+VELOCITY_DRIVE_DAMPING = 1.0e4
+POSITION_DRIVE_STIFFNESS = 1.0e5
+POSITION_DRIVE_DAMPING = 1.0e4
 
 
 def _set_transform(prim, position, rotation=(0.0, 0.0, 0.0), scale=(1.0, 1.0, 1.0)):
@@ -103,7 +136,15 @@ class MyExtension(omni.ext.IExt):
     def on_startup(self, _ext_id):
         print("[my_company.forklift_twin.core] Extension startup")
 
-        self._window = ui.Window("Forklift Digital Twin", width=340, height=280)
+        self._forklift_joints = None
+        self._update_sub = None
+        self._input_iface = None
+        self._keyboard = None
+        self._steer_target_deg = 0.0
+        self._lift_target_m = 0.0
+        self._tilt_target_deg = 0.0
+
+        self._window = ui.Window("Forklift Digital Twin", width=340, height=360)
         with self._window.frame:
             with ui.VStack(spacing=8):
                 ui.Label("Factory Setup", height=30)
@@ -115,10 +156,14 @@ class MyExtension(omni.ext.IExt):
                 ui.Button("Create Factory", height=40, clicked_fn=self._create_factory)
                 ui.Button("Add Forklift", height=32, clicked_fn=self._add_forklift)
                 ui.Button("Inspect Forklift Joints", height=32, clicked_fn=self._inspect_forklift_joints)
+                ui.Button("Enable Driving", height=32, clicked_fn=self._enable_forklift_driving)
+                ui.Button("Disable Driving", height=32, clicked_fn=self._disable_forklift_driving)
                 ui.Button("Open NVIDIA Assets", height=32, clicked_fn=self._open_asset_browser)
                 ui.Button("Reset Factory", height=32, clicked_fn=self._reset_factory)
                 ui.Label(
-                    "Create the scene, select /World/Environment, press F, then press Play.",
+                    "Create the scene, select /World/Environment, press F, then press Play.\n"
+                    "W/S drive, A/D steer, R/F mast lift, T/G mast tilt (after Enable Driving, "
+                    "and only while Play is running so physics ticks).",
                     word_wrap=True,
                 )
 
@@ -344,6 +389,171 @@ class MyExtension(omni.ext.IExt):
                 f"Found {joint_count} joint(s). Check Window > Console for full paths/axes."
             )
 
+    @staticmethod
+    def _classify_forklift_joints(forklift_prim):
+        """Best-effort keyword match of steer/drive/lift/tilt joints.
+
+        UNVERIFIED against forklift_c's actual rig -- see the keyword tuples
+        near the top of this file. A joint is claimed by the first role
+        (in steer, lift, tilt, drive order) whose keywords match its name,
+        so it can't double up as e.g. both "drive" and "steer".
+        """
+        role_keywords = (
+            ("steer", STEER_JOINT_KEYWORDS),
+            ("lift", LIFT_JOINT_KEYWORDS),
+            ("tilt", TILT_JOINT_KEYWORDS),
+            ("drive", DRIVE_JOINT_KEYWORDS),
+        )
+        joints_by_role = {role: [] for role, _ in role_keywords}
+        claimed = set()
+
+        joint_prims = [
+            prim
+            for prim in Usd.PrimRange(forklift_prim)
+            if prim.IsA(UsdPhysics.RevoluteJoint) or prim.IsA(UsdPhysics.PrismaticJoint)
+        ]
+
+        for role, keywords in role_keywords:
+            for prim in joint_prims:
+                path = prim.GetPath()
+                if path in claimed:
+                    continue
+                name = prim.GetName().lower()
+                if any(keyword in name for keyword in keywords):
+                    joints_by_role[role].append(prim)
+                    claimed.add(path)
+
+        return joints_by_role
+
+    @staticmethod
+    def _ensure_drive(prim, velocity_mode):
+        """Apply/configure DriveAPI on a joint if not already authored.
+
+        Returns the joint's drive instance name ("angular"/"linear") so
+        callers don't have to re-derive it from the prim type later.
+        """
+        if prim.IsA(UsdPhysics.RevoluteJoint):
+            instance = "angular"
+        elif prim.IsA(UsdPhysics.PrismaticJoint):
+            instance = "linear"
+        else:
+            return None
+
+        drive = UsdPhysics.DriveAPI.Apply(prim, instance)
+        stiffness_attr = drive.CreateStiffnessAttr()
+        damping_attr = drive.CreateDampingAttr()
+        if not stiffness_attr.HasAuthoredValue():
+            stiffness_attr.Set(0.0 if velocity_mode else POSITION_DRIVE_STIFFNESS)
+        if not damping_attr.HasAuthoredValue():
+            damping_attr.Set(VELOCITY_DRIVE_DAMPING if velocity_mode else POSITION_DRIVE_DAMPING)
+        drive.CreateTargetVelocityAttr().Set(0.0)
+        drive.CreateTargetPositionAttr().Set(0.0)
+        return instance
+
+    def _enable_forklift_driving(self):
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            self._status_label.text = "No USD stage is open."
+            return
+
+        forklift_prim = stage.GetPrimAtPath("/World/Vehicles/Forklift")
+        if not forklift_prim.IsValid():
+            self._status_label.text = "No forklift found. Click Add Forklift first."
+            return
+
+        joints_by_role = self._classify_forklift_joints(forklift_prim)
+        joints = {role: [] for role in joints_by_role}
+        for role, prims in joints_by_role.items():
+            for prim in prims:
+                instance = self._ensure_drive(prim, velocity_mode=(role == "drive"))
+                if instance is not None:
+                    joints[role].append((prim, instance))
+
+        summary = ", ".join(f"{role}={len(prims)}" for role, prims in joints.items())
+        print(f"[my_company.forklift_twin.core] Forklift control joints matched: {summary}")
+
+        self._forklift_joints = joints
+        self._steer_target_deg = 0.0
+        self._lift_target_m = 0.0
+        self._tilt_target_deg = 0.0
+        self._input_iface = carb.input.acquire_input_interface()
+        self._keyboard = omni.appwindow.get_default_app_window().get_keyboard()
+
+        if self._update_sub is None:
+            update_stream = omni.kit.app.get_app().get_update_event_stream()
+            self._update_sub = update_stream.create_subscription_to_pop(self._on_update)
+
+        missing = [role for role, prims in joints.items() if not prims]
+        if missing:
+            self._status_label.text = (
+                f"Driving enabled, but no joints matched for: {', '.join(missing)}. "
+                "Run Inspect Forklift Joints and tell me the real names to fix the "
+                "keyword lists at the top of extension.py."
+            )
+        else:
+            self._status_label.text = (
+                "Driving enabled. Press Play, then WASD to drive/steer, "
+                "R/F mast lift, T/G mast tilt."
+            )
+
+    def _disable_forklift_driving(self):
+        self._update_sub = None
+        self._forklift_joints = None
+        self._status_label.text = "Forklift driving disabled."
+
+    def _on_update(self, event):
+        if not self._forklift_joints:
+            return
+
+        try:
+            dt = event.payload["dt"]
+        except (AttributeError, KeyError, TypeError):
+            dt = 1.0 / 60.0
+
+        def is_down(key):
+            return self._input_iface.get_keyboard_value(self._keyboard, key) > 0.0
+
+        forward = is_down(carb.input.KeyboardInput.W)
+        backward = is_down(carb.input.KeyboardInput.S)
+        steer_left = is_down(carb.input.KeyboardInput.A)
+        steer_right = is_down(carb.input.KeyboardInput.D)
+        lift_up = is_down(carb.input.KeyboardInput.R)
+        lift_down = is_down(carb.input.KeyboardInput.F)
+        tilt_up = is_down(carb.input.KeyboardInput.T)
+        tilt_down = is_down(carb.input.KeyboardInput.G)
+
+        drive_velocity = 0.0
+        if forward and not backward:
+            drive_velocity = DRIVE_MAX_ANGULAR_VELOCITY_DEG
+        elif backward and not forward:
+            drive_velocity = -DRIVE_MAX_ANGULAR_VELOCITY_DEG
+        for prim, instance in self._forklift_joints["drive"]:
+            UsdPhysics.DriveAPI.Get(prim, instance).GetTargetVelocityAttr().Set(drive_velocity)
+
+        if steer_left and not steer_right:
+            self._steer_target_deg += STEER_RATE_DEG_PER_SEC * dt
+        elif steer_right and not steer_left:
+            self._steer_target_deg -= STEER_RATE_DEG_PER_SEC * dt
+        self._steer_target_deg = max(-STEER_MAX_ANGLE_DEG, min(STEER_MAX_ANGLE_DEG, self._steer_target_deg))
+        for prim, instance in self._forklift_joints["steer"]:
+            UsdPhysics.DriveAPI.Get(prim, instance).GetTargetPositionAttr().Set(self._steer_target_deg)
+
+        if lift_up and not lift_down:
+            self._lift_target_m += LIFT_RATE_M_PER_SEC * dt
+        elif lift_down and not lift_up:
+            self._lift_target_m -= LIFT_RATE_M_PER_SEC * dt
+        self._lift_target_m = max(LIFT_MIN_M, min(LIFT_MAX_M, self._lift_target_m))
+        for prim, instance in self._forklift_joints["lift"]:
+            UsdPhysics.DriveAPI.Get(prim, instance).GetTargetPositionAttr().Set(self._lift_target_m)
+
+        if tilt_up and not tilt_down:
+            self._tilt_target_deg += TILT_RATE_DEG_PER_SEC * dt
+        elif tilt_down and not tilt_up:
+            self._tilt_target_deg -= TILT_RATE_DEG_PER_SEC * dt
+        self._tilt_target_deg = max(-TILT_MAX_ANGLE_DEG, min(TILT_MAX_ANGLE_DEG, self._tilt_target_deg))
+        for prim, instance in self._forklift_joints["tilt"]:
+            UsdPhysics.DriveAPI.Get(prim, instance).GetTargetPositionAttr().Set(self._tilt_target_deg)
+
     def _open_asset_browser(self):
         ui.Workspace.show_window("NVIDIA Assets")
         self._status_label.text = "NVIDIA Assets browser opened."
@@ -358,8 +568,10 @@ class MyExtension(omni.ext.IExt):
             if stage.GetPrimAtPath(path):
                 stage.RemovePrim(path)
 
+        self._disable_forklift_driving()
         self._status_label.text = "Factory content removed."
 
     def on_shutdown(self):
         print("[my_company.forklift_twin.core] Extension shutdown")
+        self._update_sub = None
         self._window = None
