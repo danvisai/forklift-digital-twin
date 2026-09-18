@@ -4,7 +4,7 @@
 import omni.ext
 import omni.ui as ui
 import omni.usd
-from pxr import Gf, Sdf, UsdGeom, UsdLux, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics
 
 
 ASSET_ROOT = (
@@ -114,6 +114,7 @@ class MyExtension(omni.ext.IExt):
                 )
                 ui.Button("Create Factory", height=40, clicked_fn=self._create_factory)
                 ui.Button("Add Forklift", height=32, clicked_fn=self._add_forklift)
+                ui.Button("Inspect Forklift Joints", height=32, clicked_fn=self._inspect_forklift_joints)
                 ui.Button("Open NVIDIA Assets", height=32, clicked_fn=self._open_asset_browser)
                 ui.Button("Reset Factory", height=32, clicked_fn=self._reset_factory)
                 ui.Label(
@@ -290,6 +291,58 @@ class MyExtension(omni.ext.IExt):
             "Forklift placed at /World/Vehicles/Forklift. Select it, press F to "
             "frame, and check it's facing down the aisle."
         )
+
+    def _inspect_forklift_joints(self):
+        """Walk the referenced forklift and list its physics joints.
+
+        forklift_c's exact rig (joint names/axes) isn't documented, so this
+        reads it back from the loaded stage rather than guessing -- run this
+        once, then the control-scheme code can target the real joint paths
+        printed to the console (Window > Console).
+        """
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            self._status_label.text = "No USD stage is open."
+            return
+
+        forklift_prim = stage.GetPrimAtPath("/World/Vehicles/Forklift")
+        if not forklift_prim.IsValid():
+            self._status_label.text = "No forklift found. Click Add Forklift first."
+            return
+
+        joint_type_names = {
+            UsdPhysics.RevoluteJoint: "RevoluteJoint",
+            UsdPhysics.PrismaticJoint: "PrismaticJoint",
+            UsdPhysics.FixedJoint: "FixedJoint",
+            UsdPhysics.SphericalJoint: "SphericalJoint",
+        }
+
+        print("[my_company.forklift_twin.core] Forklift joints under /World/Vehicles/Forklift:")
+        joint_count = 0
+        for prim in Usd.PrimRange(forklift_prim):
+            for joint_schema, type_name in joint_type_names.items():
+                if not prim.IsA(joint_schema):
+                    continue
+                joint = joint_schema(prim)
+                axis = joint.GetAxisAttr().Get() if hasattr(joint, "GetAxisAttr") else None
+                body0 = joint.GetBody0Rel().GetTargets()
+                body1 = joint.GetBody1Rel().GetTargets()
+                has_drive = prim.HasAPI(UsdPhysics.DriveAPI)
+                print(
+                    f"  [{type_name}] {prim.GetPath()}  axis={axis}  "
+                    f"body0={body0}  body1={body1}  DriveAPI={has_drive}"
+                )
+                joint_count += 1
+
+        if joint_count == 0:
+            self._status_label.text = (
+                "No physics joints found on the forklift prim -- it may not "
+                "have loaded yet, or the rig lives on a different sub-path."
+            )
+        else:
+            self._status_label.text = (
+                f"Found {joint_count} joint(s). Check Window > Console for full paths/axes."
+            )
 
     def _open_asset_browser(self):
         ui.Workspace.show_window("NVIDIA Assets")
