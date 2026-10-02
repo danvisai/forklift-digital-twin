@@ -50,6 +50,14 @@ public:
 	float GetLastRequestMs() const { return LastRequestMs; }
 	bool IsConnected() const { return bEverSucceeded && ConsecutiveFailures == 0; }
 	FString GetStatus() const;
+	int32 GetResultSerial() const { return ResultSerial; }
+
+	/** Pose of the camera when the frame behind the latest result was rendered. Boxes and depth must be projected with THIS pose,
+	 *  not the camera's current one: the answer arrives after the truck has moved on (sensor-pose time synchronisation). */
+	const FTransform& GetResultCameraTransform() const { return LastCameraXf; }
+
+	/** Depth captured with the RGB image that produced the latest boxes. Pixel coordinates use that image. */
+	bool GetDepthAtPixel(int32 X, int32 Y, float& OutDepthCm) const;
 
 	/** e.g. http://127.0.0.1:8765/detect. */
 	UPROPERTY(EditAnywhere)
@@ -66,8 +74,17 @@ private:
 	void OnResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
 
 	TArray<FForkliftDetectionBox> LastBoxes;
+	FTransform PendingCameraXf;
+	FTransform LastCameraXf;
+	TArray<float> PendingDepthCm;
+	TArray<float> LastDepthCm;
 	int32 ImageWidth = 0;
 	int32 ImageHeight = 0;
+	int32 PendingDepthWidth = 0;
+	int32 PendingDepthHeight = 0;
+	int32 LastDepthWidth = 0;
+	int32 LastDepthHeight = 0;
+	int32 ResultSerial = 0;
 	float LastRequestMs = 0.f;
 	FString LastError;
 	bool bRequestInFlight = false;

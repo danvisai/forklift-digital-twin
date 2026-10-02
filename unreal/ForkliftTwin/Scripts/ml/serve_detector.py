@@ -30,17 +30,22 @@ LOCK = threading.Lock()  # one inference at a time; the GPU is the bottleneck an
 
 
 def decode(handler: BaseHTTPRequestHandler, body: bytes) -> np.ndarray:
-    """Return an HxWx3 RGB uint8 array."""
+    """Return an HxWx3 BGR uint8 array - ultralytics' ndarray convention (same as cv2.imread; it
+    silently assumes BGR for a raw array input, unlike a file path, which it loads and converts
+    itself). Feeding it RGB here previously channel-swapped every live frame, which cost little on
+    shape-robust classes like tote but was enough to keep pallet/pallet_pocket confidence under the
+    serving threshold almost always - confirmed by comparing model.predict() on the same frame in
+    both channel orders (BGR: ~0.7 conf, RGB: <0.1 conf)."""
     ctype = handler.headers.get("Content-Type", "")
     if ctype.startswith("image/"):
-        return np.asarray(Image.open(io.BytesIO(body)).convert("RGB"))
+        return np.asarray(Image.open(io.BytesIO(body)).convert("RGB"))[:, :, ::-1]
     w = int(handler.headers["X-Width"])
     h = int(handler.headers["X-Height"])
     fmt = handler.headers.get("X-Format", "BGRA").upper()
     if fmt == "BGRA":
-        return np.frombuffer(body, np.uint8).reshape(h, w, 4)[:, :, [2, 1, 0]]
+        return np.frombuffer(body, np.uint8).reshape(h, w, 4)[:, :, :3]  # already B,G,R - just drop alpha
     if fmt == "RGB":
-        return np.frombuffer(body, np.uint8).reshape(h, w, 3)
+        return np.frombuffer(body, np.uint8).reshape(h, w, 3)[:, :, ::-1]
     raise ValueError(f"unsupported X-Format {fmt}")
 
 

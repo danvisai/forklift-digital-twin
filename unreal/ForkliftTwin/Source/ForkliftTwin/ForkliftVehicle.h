@@ -11,7 +11,11 @@ class UCameraComponent;
 class UBoxComponent;
 class UPhysicalMaterial;
 class ULidarSensorComponent;
+class UForkliftPalletFinderComponent;
 class UForkliftCameraComponent;
+class UForkliftAutoPickupComponent;
+class UForkliftNavComponent;
+class UForkliftMissionComponent;
 struct FForkliftRigSpec;
 
 UENUM(BlueprintType)
@@ -110,8 +114,25 @@ public:
 	/** RGB camera on the fork carriage: it rises and falls with the forks and looks along them. */
 	UForkliftCameraComponent* GetForkCamera() const { return ForkCamera; }
 
+	/** Low RGB-D camera between the tines, used for pocket alignment and insertion. */
+	UForkliftCameraComponent* GetTineCamera() const { return TineCamera; }
+
+	UForkliftAutoPickupComponent* GetAutoPickup() const { return AutoPickup; }
+
+	/** Waypoint-graph planner + pure-pursuit follower for driving to a named pose across the warehouse. */
+	UForkliftNavComponent* GetNav() const { return Nav; }
+
+	/** Autonomous pickup -> carry -> place mission supervisor (M key, or -ForkliftMission). */
+	UForkliftMissionComponent* GetMission() const { return Mission; }
+
+	/** Finds floor pallets from fork-camera detections + depth (no positions read from the simulator). */
+	UForkliftPalletFinderComponent* GetFinder() const { return Finder; }
+
 	/** 360 degree lidar fixed to the chassis. */
 	ULidarSensorComponent* GetLidar() const { return Lidar; }
+
+	/** Low forward lidar on the front of the body, sees the floor-level objects the roof lidar cannot (< ~4 m). */
+	ULidarSensorComponent* GetLowLidar() const { return LowLidar; }
 
 	/** Last commanded inputs (-1..1), e.g. to log them next to sensor frames. */
 	float GetThrottleCmd() const { return ThrottleCmd; }
@@ -273,7 +294,21 @@ private:
 	UPROPERTY(VisibleAnywhere, Category = "Forklift|Sensors")
 	TObjectPtr<UForkliftCameraComponent> ForkCamera;
 	UPROPERTY(VisibleAnywhere, Category = "Forklift|Sensors")
+	TObjectPtr<UForkliftCameraComponent> TineCamera;
+	UPROPERTY(VisibleAnywhere, Category = "Forklift|Sensors")
 	TObjectPtr<ULidarSensorComponent> Lidar;
+
+	UPROPERTY(VisibleAnywhere, Category = "Forklift|Sensors")
+	TObjectPtr<ULidarSensorComponent> LowLidar;
+
+	UPROPERTY(VisibleAnywhere, Category = "Forklift|Sensors")
+	TObjectPtr<UForkliftPalletFinderComponent> Finder;
+	UPROPERTY(VisibleAnywhere, Category = "Forklift|Automation")
+	TObjectPtr<UForkliftAutoPickupComponent> AutoPickup;
+	UPROPERTY(VisibleAnywhere, Category = "Forklift|Automation")
+	TObjectPtr<UForkliftNavComponent> Nav;
+	UPROPERTY(VisibleAnywhere, Category = "Forklift|Automation")
+	TObjectPtr<UForkliftMissionComponent> Mission;
 
 	TArray<FWheel> Wheels;
 	EForkliftModel ActiveModel = EForkliftModel::ForkliftB;

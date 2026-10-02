@@ -9,10 +9,14 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "ForkliftCameraComponent.h"
+#include "ForkliftAutoPickupComponent.h"
+#include "ForkliftNavComponent.h"
+#include "ForkliftMissionComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "InputCoreTypes.h"
 #include "LidarSensorComponent.h"
+#include "ForkliftPalletFinderComponent.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
@@ -69,7 +73,10 @@ struct FForkliftRigSpec
 
 	FVector CameraPosCm = FVector::ZeroVector;
 	FRotator CameraRot = FRotator::ZeroRotator;
+	FVector TineCameraPosCm = FVector::ZeroVector;
+	FRotator TineCameraRot = FRotator::ZeroRotator;
 	FVector LidarPosCm = FVector::ZeroVector;
+	FVector LowLidarPosCm = FVector(100.f, 0.f, 30.f);   // body frame; just ahead of the operator platform
 
 	FVector ForkTipCm = FVector::ZeroVector;  // middle of the tine tips at fork rest pose
 	float ForkStopXCm = 0.f;                  // a seated pallet's near edge sits here (platform front / backrest)
@@ -120,6 +127,8 @@ namespace
 		// and the floor ahead are in view. Lidar: 10 cm above the overhead guard (roof at z=212 cm), over the seat.
 		R.CameraPosCm = FVector(90.f, 0.f, 128.f);
 		R.CameraRot = FRotator(-20.f, 0.f, 0.f);
+		R.TineCameraPosCm = FVector(86.f, 0.f, 24.f);
+		R.TineCameraRot = FRotator(-5.f, 0.f, 0.f);
 		R.LidarPosCm = FVector(-55.f, 0.f, 222.f);
 		R.ForkTipCm = FVector(187.f, 0.f, 12.f);
 		R.ForkStopXCm = 82.f;  // backrest face
@@ -171,7 +180,12 @@ namespace
 		// to the body, not the rising cab).
 		R.CameraPosCm = FVector(116.f, 0.f, 236.f);
 		R.CameraRot = FRotator(-28.f, 0.f, 0.f);
+		// Low camera just ahead of the operator platform, centred between the tines. At the pocket-entry lift
+		// height its optical axis is roughly level with the openings; a small downward pitch keeps the tips visible.
+		R.TineCameraPosCm = FVector(112.f, 0.f, 30.f);
+		R.TineCameraRot = FRotator(-5.f, 0.f, 0.f);
 		R.LidarPosCm = FVector(-50.f, 0.f, 116.f);
+		R.LowLidarPosCm = FVector(115.f, 0.f, 32.f);   // platform front edge is x=110; tines/load are rays' blind spot, masked in features
 		R.ForkTipCm = FVector(215.f, 0.f, 20.65f);
 		R.ForkStopXCm = 110.f;  // front edge of the operator platform
 
@@ -242,7 +256,10 @@ AForkliftVehicle::AForkliftVehicle()
 	CameraArm->TargetArmLength = 500.f;
 	CameraArm->SetRelativeLocation(FVector(0.f, 0.f, 120.f));
 	CameraArm->SetRelativeRotation(FRotator(-18.f, 0.f, 0.f));
-	CameraArm->bDoCollisionTest = false;
+	// Every vehicle part already ignores ECC_Camera (see MakePart), so this only pulls the camera in for
+	// walls/racks/other world geometry, never the truck itself - safe to turn on now that the bigger
+	// warehouse gives the chase cam more wall/rack surface to clip through near the aisles.
+	CameraArm->bDoCollisionTest = true;
 	CameraArm->bInheritPitch = false;
 	CameraArm->bInheritRoll = false;
 	// No rotation lag: UpdateMouseLook already sets the arm's rotation directly every tick, so the spring arm's own
@@ -256,8 +273,47 @@ AForkliftVehicle::AForkliftVehicle()
 	// Both mount transforms are set per model in ApplyMounts().
 	ForkCamera = CreateDefaultSubobject<UForkliftCameraComponent>(TEXT("ForkCamera"));
 	ForkCamera->SetupAttachment(Lift);
+	// Needed for the HUD's depth-view toggle (L): metric depth aligned to this camera's RGB frame.
+	ForkCamera->bCaptureDepth = true;
+	// Required for AutoExposureBias/ExposureEV to have any effect at all - see
+	// UForkliftCameraComponent::ApplyExposure()'s comment. Must be set before the component registers
+	// (i.e. here in the constructor, not later in BeginPlay), matching how SyntheticDataGenerator's own
+	// camera already does this successfully.
+	ForkCamera->bAlwaysPersistRenderingState = true;
+	// 6.7 measured ~160 mean luma / zero clipping for this specific camera (640x480, 90 deg FOV) against
+	// the current warehouse lighting - close to the ~154 luma the detector's synthetic training data was
+	// calibrated to (see ForkliftCameraComponent.h's ExposureEV comment). Not the same numeric value as
+	// SyntheticDataGenerator's own BaseEV=9.5: that camera has a different FOV/resolution/typical
+	// distance from the lights, so the same visual brightness needs a different EV even with the same
+	// underlying exposure mechanism now working correctly for both.
+	ForkCamera->ExposureEV = 6.7f;
+	TineCamera = CreateDefaultSubobject<UForkliftCameraComponent>(TEXT("TineCamera"));
+	TineCamera->SetupAttachment(Lift);
+	TineCamera->FOVAngle = 78.f;
+	TineCamera->CaptureRateHz = 10.f;
+	TineCamera->bCaptureDepth = true;
+	TineCamera->bHideOwner = true;
+	TineCamera->bAlwaysPersistRenderingState = true;
+	TineCamera->ExposureEV = 6.7f;   // measured ~160 mean luma / zero clipping, see ForkCamera's comment above
 	Lidar = CreateDefaultSubobject<ULidarSensorComponent>(TEXT("Lidar"));
 	Lidar->SetupAttachment(Body);
+	// Roof lidar looks further down so floor-level objects start to appear at ~2.5 m (was 4.3 m at -15 deg).
+	Lidar->VerticalMinDeg = -25.f;
+	Lidar->VerticalMaxDeg = 10.f;
+	LowLidar = CreateDefaultSubobject<ULidarSensorComponent>(TEXT("LowLidar"));
+	LowLidar->SetupAttachment(Body);
+	LowLidar->Channels = 6;
+	LowLidar->HorizontalSteps = 240;
+	LowLidar->HorizontalFovDeg = 240.f;
+	LowLidar->VerticalMinDeg = -12.f;
+	LowLidar->VerticalMaxDeg = 3.f;
+	LowLidar->MinRangeCm = 30.f;
+	LowLidar->MaxRangeCm = 1500.f;
+	LowLidar->PrimaryComponentTick.bStartWithTickEnabled = false;   // scanned on demand (datasets / learned nav) - no idle cost
+	AutoPickup = CreateDefaultSubobject<UForkliftAutoPickupComponent>(TEXT("AutoPickup"));
+	Nav = CreateDefaultSubobject<UForkliftNavComponent>(TEXT("Nav"));
+	Mission = CreateDefaultSubobject<UForkliftMissionComponent>(TEXT("Mission"));
+	Finder = CreateDefaultSubobject<UForkliftPalletFinderComponent>(TEXT("PalletFinder"));
 }
 
 UStaticMeshComponent* AForkliftVehicle::MakePart(FName Name)
@@ -344,7 +400,9 @@ void AForkliftVehicle::AssignMeshes()
 void AForkliftVehicle::ApplyMounts()
 {
 	ForkCamera->SetRelativeLocationAndRotation(Rig->CameraPosCm, Rig->CameraRot);
+	TineCamera->SetRelativeLocationAndRotation(Rig->TineCameraPosCm, Rig->TineCameraRot);
 	Lidar->SetRelativeLocation(Rig->LidarPosCm);
+	LowLidar->SetRelativeLocation(Rig->LowLidarPosCm);
 }
 
 void AForkliftVehicle::SetupWheels()
@@ -563,6 +621,14 @@ void AForkliftVehicle::Tick(float DeltaSeconds)
 		ReadKeyboard();
 	}
 	UpdateMouseLook(Dt);
+	if (const APlayerController* PC = Cast<APlayerController>(GetController()); PC && AutoPickup && PC->WasInputKeyJustPressed(EKeys::P))
+	{
+		AutoPickup->TogglePickup();
+	}
+	if (const APlayerController* PC = Cast<APlayerController>(GetController()); PC && Mission && PC->WasInputKeyJustPressed(EKeys::M))
+	{
+		Mission->ToggleMission();
+	}
 
 	// Steering: integrate like the Kit prototype, but return to centre when the key is released
 	// (a real truck's operator steers back; the prototype held the last angle).

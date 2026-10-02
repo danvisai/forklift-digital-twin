@@ -24,7 +24,15 @@ void UForkliftDetectionClient::Poll(UForkliftCameraComponent* Camera, float Delt
 	{
 		return;  // no frame yet (e.g. the very first tick)
 	}
+	PendingDepthCm.Reset();
+	PendingDepthWidth = PendingDepthHeight = 0;
+	if (Camera->ReadDepthCm(PendingDepthCm) && PendingDepthCm.Num() == Camera->Width * Camera->Height)
+	{
+		PendingDepthWidth = Camera->Width;
+		PendingDepthHeight = Camera->Height;
+	}
 	TimeSinceRequest = 0.f;
+	PendingCameraXf = Camera->GetLastCaptureTransform();
 
 	TArray<uint8> Bytes;
 	Bytes.SetNumUninitialized(Pixels.Num() * sizeof(FColor));
@@ -97,9 +105,29 @@ void UForkliftDetectionClient::OnResponse(FHttpRequestPtr Request, FHttpResponse
 		}
 	}
 	LastBoxes = MoveTemp(Boxes);
+	LastCameraXf = PendingCameraXf;
+	LastDepthCm = MoveTemp(PendingDepthCm);
+	LastDepthWidth = PendingDepthWidth;
+	LastDepthHeight = PendingDepthHeight;
+	++ResultSerial;
 	LastError.Reset();
 	ConsecutiveFailures = 0;
 	bEverSucceeded = true;
+}
+
+bool UForkliftDetectionClient::GetDepthAtPixel(int32 X, int32 Y, float& OutDepthCm) const
+{
+	if (X < 0 || Y < 0 || X >= LastDepthWidth || Y >= LastDepthHeight || LastDepthCm.Num() != LastDepthWidth * LastDepthHeight)
+	{
+		return false;
+	}
+	const float Depth = LastDepthCm[Y * LastDepthWidth + X];
+	if (!FMath::IsFinite(Depth) || Depth <= 0.f || Depth > 100000.f)
+	{
+		return false;
+	}
+	OutDepthCm = Depth;
+	return true;
 }
 
 FString UForkliftDetectionClient::GetStatus() const

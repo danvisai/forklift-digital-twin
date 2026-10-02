@@ -26,6 +26,7 @@ and everything under `Content/` is generated from them (see `.gitignore`).
 | W / S (or Up / Down) | drive forward / back |
 | A / D (or Left / Right) | steer left / right (rear-wheel steering) |
 | R / F | raise / lower the forks (0-2 m) |
+| P | start / abort vision-guided pallet alignment, insertion and lift |
 | Mouse | free-look chase camera (stacks on top of the truck's own heading; `AForkliftVehicle::bMouseLook`) |
 | V | show / hide the sensor view (fork camera + top-down lidar) |
 
@@ -36,14 +37,23 @@ each -1..1, with `bKeyboardControl = false`.
 
 | Sensor | Where | Output |
 |---|---|---|
-| `ForkCamera` (`UForkliftCameraComponent`) | top of the carriage backrest, 20 deg down; rises and falls with the forks | RGB 320x240, 90 deg FOV, 10 Hz, fixed exposure |
+| `ForkCamera` (`UForkliftCameraComponent`) | top of the carriage backrest, looking down; rises and falls with the forks | RGB 640x480, 90 deg FOV, 10 Hz, fixed exposure |
+| `TineCamera` (`UForkliftCameraComponent`) | low and centred between the tines; rises and falls with them | aligned RGB + metric depth, 78 deg FOV, 10 Hz |
 | `Lidar` (`ULidarSensorComponent`) | cab roof, 10 cm above the overhead guard | 16 channels x 360 azimuth steps, -15..+15 deg, 0.3-30 m, 10 Hz |
 
-Get them with `AForkliftVehicle::GetForkCamera()` / `GetLidar()`. The camera hands out pixels (`ReadPixelsBgra`,
+Get them with `AForkliftVehicle::GetForkCamera()` / `GetTineCamera()` / `GetLidar()`. The cameras hand out pixels (`ReadPixelsBgra`,
 `SavePng`); the lidar keeps `Ranges` (channel-major, cm, -1 = no return) and `Points` (sensor frame, cm), and both
 can be written as `.npy` (`SaveRangesNpy`, `SavePointsNpy`) for `np.load`. Rates, resolution, FOV, noise and
 mount transforms are properties, editable per instance. UE has no built-in lidar, so this one is ray traces:
 about 9-12 ms per scan on the game thread with the default 5760 rays.
+
+The low camera feeds `UForkliftAutoPickupComponent`. Press `P` (or launch with `-ForkliftAutoPickup`) while two
+`pallet_pocket` detections are visible. The controller requires both pockets, uses their synchronized depth to
+correct lateral/yaw/height error, approaches slowly, inserts a bounded odometry distance after the openings leave
+view, settles, and raises the load. It aborts on target loss, unsafe close-range misalignment, or timeout. Run
+`Scripts/ml/serve_detector.py` first; the existing model and `/detect` endpoint are reused for both cameras.
+For a reproducible end-to-end run, use `-ForkliftAutoPickupTest`; it parks square to the loose pallet, runs at a
+fixed 60 Hz step, logs `[AutoPickup]` state changes, and exits 0 on completion (nonzero on abort/timeout).
 
 Things to know: the lidar's rays ignore the truck's own body (no self-occlusion, optimistic against a real
 unit); a roof lidar limited to +-15 deg cannot see anything on the floor within ~8 m, so pallets and bins are
@@ -74,7 +84,8 @@ invisible to it (the camera sees them); the hall has no ceiling, so the upper ch
 - Materials are approximated: the NVIDIA MDL materials and UDIM atlas don't import, so the forklift's colours
   are sampled from its own albedo/ORM atlas (paint uses the asset's yellow variant tint) and the props use
   hand-picked colours. Decals are dropped.
-- Pallets, bins and guard rails have simple box collision (the Kit had none); racks keep the Kit's proxy boxes.
+- The loose pickup pallet uses five analytic boxes that preserve its two fork openings; other pallets, bins and
+  guard rails use simple box collision (the Kit had none), and racks keep the Kit's proxy boxes.
 - GI/reflections use Lumen and virtual shadow maps are off (`Config/DefaultEngine.ini`). If it's too heavy,
   set `r.DynamicGlobalIlluminationMethod=0`, `r.ReflectionMethod=2` - shadows get much darker without GI.
 
@@ -93,10 +104,17 @@ UnrealEditor.exe ForkliftTwin.uproject /Game/Maps/Warehouse -game -windowed -Res
 ```
 
 Sensor check (needs a real renderer, not `-nullrhi`): parks the truck facing the pallets, writes a camera PNG and
-lidar `.npy` files to `Saved/SensorTest/` at fork height 0 and ~1 m, logs `[SensorTest]` lines and quits:
+low-camera RGB/depth plus lidar `.npy` files to `Saved/SensorTest/` at fork height 0 and ~1 m, logs `[SensorTest]`
+lines and quits:
 
 ```
 UnrealEditor.exe ForkliftTwin.uproject /Game/Maps/Warehouse -game -windowed -ResX=960 -ResY=540 -ForkliftSensorTest
+```
+
+End-to-end auto-pick check (requires `Scripts/ml/serve_detector.py` and a real renderer):
+
+```
+UnrealEditor-Cmd.exe ForkliftTwin.uproject /Game/Maps/Warehouse -game -RenderOffscreen -unattended -ForkliftAutoPickupTest -stdout
 ```
 
 Output lands in `Saved/Screenshots/WindowsEditor/`. (Git Bash rewrites `/Game/...`; set `MSYS_NO_PATHCONV=1`.)

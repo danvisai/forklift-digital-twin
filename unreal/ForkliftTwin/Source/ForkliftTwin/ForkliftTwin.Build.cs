@@ -8,7 +8,7 @@ public class ForkliftTwin : ModuleRules
 
 		PublicDependencyModuleNames.AddRange(new string[]
 		{
-			"Core", "CoreUObject", "Engine", "InputCore", "PhysicsCore", "RenderCore", "Json", "HTTP"
+			"Core", "CoreUObject", "Engine", "InputCore", "PhysicsCore", "RenderCore", "Json", "HTTP", "ImageWrapper"
 		});
 	}
 }

@@ -6,6 +6,7 @@
 #include "ForkliftCameraComponent.generated.h"
 
 class UTextureRenderTarget2D;
+class UTexture2D;
 
 /**
  * Renders the scene from this component at CaptureRateHz into a Width x Height render target, and hands the
@@ -31,6 +32,9 @@ public:
 
 	virtual void BeginPlay() override;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+
+	/** World pose of this camera at the moment the latest frame was rendered (the frame is read back some ticks later while the truck keeps moving). */
+	const FTransform& GetLastCaptureTransform() const { return LastCaptureXf; }
 
 	/** Render a frame now (RGB, plus depth if enabled), regardless of CaptureRateHz. */
 	UFUNCTION(BlueprintCallable, Category = "Camera")
@@ -60,6 +64,18 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Camera")
 	UTextureRenderTarget2D* GetDepthRenderTarget() const { return DepthTarget; }
 
+	/**
+	 * Colorize the last captured depth frame with a turbo colormap (near = warm/red, far = cool/blue) into a
+	 * persistent on-screen texture and return it. Reads back the GPU depth target, same cost as ReadDepthCm(),
+	 * so call it only as often as you actually redraw it (e.g. a throttled HUD timer), not every tick. Returns
+	 * null without depth enabled (bCaptureDepth) or before the first capture.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Camera|Depth")
+	UTexture2D* UpdateDepthColorTexture(float NearCm, float FarCm);
+
+	UFUNCTION(BlueprintPure, Category = "Camera|Depth")
+	UTexture2D* GetDepthColorTexture() const { return DepthColorTexture; }
+
 	/** Number of frames rendered so far. */
 	UFUNCTION(BlueprintPure, Category = "Camera")
 	int32 GetFrameIndex() const { return FrameIndex; }
@@ -77,13 +93,21 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
 	bool bAutoCapture = true;
 
-	/** Manual exposure, EV100. 12 matches the project's screenshot preset for the daylight-lit hall. */
+	/** Manual exposure compensation (AutoExposureBias, see ApplyExposure()). 9.5 matches
+	 *  SyntheticDataGenerator's calibrated BaseEV for the current enclosed, artificially-lit hall
+	 *  (measured against its own saved frames: mean luma ~131-159, no clipping). Only takes effect if
+	 *  bAlwaysPersistRenderingState (inherited from USceneCaptureComponent) is true - see
+	 *  ApplyExposure()'s comment. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
-	float ExposureEV = 12.f;
+	float ExposureEV = 9.5f;
 
 	/** Also render aligned metric depth (doubles the render cost, so off by default). */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera|Depth")
 	bool bCaptureDepth = false;
+
+	/** Hide every component owned by the vehicle from RGB and depth (useful for the camera between the tines). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
+	bool bHideOwner = false;
 
 private:
 	void ApplyExposure();
@@ -94,6 +118,12 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UTextureRenderTarget2D> DepthTarget;
 
+	UPROPERTY(Transient)
+	TObjectPtr<UTexture2D> DepthColorTexture;
+
 	float TimeSinceCapture = 0.f;
 	int32 FrameIndex = 0;
+
+private:
+	FTransform LastCaptureXf;
 };

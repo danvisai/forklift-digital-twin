@@ -12,6 +12,10 @@
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "ForkliftCameraComponent.h"
+#include "ForkliftDetectionClient.h"
+#include "ForkliftAutoPickupComponent.h"
+#include "ForkliftNavComponent.h"
+#include "ForkliftMissionComponent.h"
 #include "ForkliftHUD.h"
 #include "ForkliftVehicle.h"
 #include "GameFramework/PlayerController.h"
@@ -20,8 +24,13 @@
 #include "Warehouse.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "Components/BoxComponent.h"
+#include "HAL/IConsoleManager.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Modules/ModuleManager.h"
 #include "Misc/App.h"
 #include "Misc/CommandLine.h"
 #include "Misc/CoreDelegates.h"
@@ -29,6 +38,9 @@
 #include "ShaderCompiler.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogForkliftTwin, Log, All);
+
+namespace { FString LidarDumpPath(); }
+namespace { FString RecordPath(); }
 
 AForkliftGameMode::AForkliftGameMode()
 {
@@ -66,7 +78,7 @@ void AForkliftGameMode::StartPlay()
 
 	if (GEngine && Forklift && !FParse::Param(FCommandLine::Get(), TEXT("ForkliftSelfTest")))
 	{
-		GEngine->AddOnScreenDebugMessage(101, 30.f, FColor::Cyan, TEXT("W/S drive   A/D steer (rear-wheel)   R/F mast up/down   mouse look   V sensor view"));
+		GEngine->AddOnScreenDebugMessage(101, 30.f, FColor::Cyan, TEXT("W/S drive   A/D steer   R/F mast   P auto-pick/abort   mouse look   V sensors   L depth view"));
 	}
 
 	bSensorTest = FParse::Param(FCommandLine::Get(), TEXT("ForkliftSensorTest"));
@@ -90,7 +102,7 @@ void AForkliftGameMode::StartPlay()
 		{
 		case 1: ShotPos = Base + Yaw.RotateVector(FVector(520.f, -380.f, 230.f)); break;   // front-left three-quarter
 		case 2: ShotPos = Base + Yaw.RotateVector(FVector(-420.f, 460.f, 320.f)); break;   // rear-right three-quarter
-		case 3: ShotPos = FVector(-900.f, 1100.f, 900.f); Target = FVector(0.f, 100.f, 80.f); break;  // overview of the hall
+		case 3: ShotPos = FVector(-1350.f, 1650.f, 1350.f); Target = FVector(0.f, 150.f, 80.f); break;  // overview of the (now 36x24 m) hall
 		default: ShotPos = Base + Yaw.RotateVector(FVector(-700.f, 0.f, 260.f)); break;    // 0 = behind the truck
 		}
 		ShotRot = (Target - ShotPos).Rotation();
@@ -102,6 +114,32 @@ void AForkliftGameMode::StartPlay()
 				GetWorld()->GetFirstPlayerController()->SetViewTarget(Cam);
 			}
 		}
+	}
+
+	bAutoPickupHarness = FParse::Param(FCommandLine::Get(), TEXT("ForkliftAutoPickupTest"));
+	if (bAutoPickupHarness && Forklift)
+	{
+		// Reproducible camera/controller test: start square to the dynamic loose pallet, 3.5 m from its face.
+		Forklift->bKeyboardControl = false;
+		FApp::SetUseFixedTimeStep(true);
+		FApp::SetFixedDeltaTime(1.0 / 60.0);
+		for (TActorIterator<AWarehouse> It(GetWorld()); It; ++It)
+		{
+			AutoPickupPallet = It->GetLoosePallet();
+			break;
+		}
+		if (AutoPickupPallet.IsValid())
+		{
+			AutoPickupPalletHome = AutoPickupPallet->GetComponentTransform();
+			AutoPickupPalletStartZ = AutoPickupPallet->GetComponentLocation().Z;
+		}
+		PlaceAutoPickupCase(ReadAutoPickupCaseArgs());
+		// Let the teleported body settle (steering centred, lift lowered) before StartPickup() - the
+		// same sequence PollAutoPickupRun uses for the PIE batch harness. Starting acquisition
+		// immediately after a hard ResetPhysics teleport locks the vision system onto a frame captured
+		// before the raycast-wheel body has actually settled onto its commanded pose/yaw.
+		bAutoPickupResetting = true;
+		AutoPickupResetTime = 0.f;
 	}
 
 	bPalletTest = FParse::Param(FCommandLine::Get(), TEXT("ForkliftPalletTest"));
@@ -129,6 +167,174 @@ void AForkliftGameMode::StartPlay()
 		}
 	}
 
+	bIdentTest = FParse::Param(FCommandLine::Get(), TEXT("ForkliftIdentTest"));
+	if (bIdentTest && Forklift)
+	{
+		Forklift->bKeyboardControl = false;
+		FApp::SetUseFixedTimeStep(true);
+		FApp::SetFixedDeltaTime(1.0 / 60.0);
+		IdentSpawnXf = Forklift->GetActorTransform();
+		IdentCase = 0;
+		IdentSeg = -1;
+		bIdentSettling = true;
+		IdentSettleTime = 0.f;
+		IFileManager::Get().MakeDirectory(*(FPaths::ProjectSavedDir() / TEXT("Ident")), true);
+		UE_LOG(LogForkliftTwin, Log, TEXT("[IdentTest] starting from %s"), *IdentSpawnXf.ToString());
+	}
+
+	bRecord = FParse::Param(FCommandLine::Get(), TEXT("ForkliftRecord")) || FParse::Value(FCommandLine::Get(), TEXT("ForkliftRecord="), RecordFps);
+	if (bRecord && Forklift)
+	{
+		FParse::Value(FCommandLine::Get(), TEXT("ForkliftRecord="), RecordFps);
+		RecordSetup();
+	}
+
+	bLidarDump = FParse::Param(FCommandLine::Get(), TEXT("ForkliftLidarDump")) || FParse::Value(FCommandLine::Get(), TEXT("ForkliftLidarDump="), LidarDumpScenes);
+	if (bLidarDump && Forklift)
+	{
+		Forklift->bKeyboardControl = false;
+		FApp::SetUseFixedTimeStep(true);
+		FApp::SetFixedDeltaTime(1.0 / 60.0);
+		FParse::Value(FCommandLine::Get(), TEXT("ForkliftLidarDump="), LidarDumpScenes);
+		int32 Seed = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("LidarDumpSeed="), Seed);
+		LidarDumpRng.Initialize(Seed);
+		for (TActorIterator<AWarehouse> It(GetWorld()); It; ++It)
+		{
+			LidarDumpStatic = It->GetObstacleBoxes();
+			for (const FLoosePallet& P : It->GetLoosePallets())
+			{
+				if (P.Comp)
+				{
+					LidarDumpStatic.Add(P.Comp->Bounds.GetBox());
+				}
+			}
+			break;
+		}
+		IFileManager::Get().MakeDirectory(*(LidarDumpPath()), true);
+		// world.json: the static geometry the Python twin (Scripts/ml/nav/forklift_sim.py) loads, so both share one layout.
+		{
+			const auto Num = [](double V) { return FString::Printf(TEXT("%.1f"), V); };
+			FString Json = TEXT("{\n \"obstacles\": [");
+			TArray<FBox> Statics;
+			for (TActorIterator<AWarehouse> It(GetWorld()); It; ++It)
+			{
+				Statics = It->GetObstacleBoxes();
+				break;
+			}
+			for (int32 I = 0; I < Statics.Num(); ++I)
+			{
+				const FBox& B = Statics[I];
+				Json += FString::Printf(TEXT("%s[%s,%s,%s,%s,%s,%s]"), I ? TEXT(",") : TEXT(""), *Num(B.Min.X), *Num(B.Min.Y), *Num(B.Min.Z), *Num(B.Max.X), *Num(B.Max.Y), *Num(B.Max.Z));
+			}
+			Json += TEXT("],\n \"loose_pallets\": [");
+			bool bFirst = true;
+			FString SlotsJson;
+			for (TActorIterator<AWarehouse> It(GetWorld()); It; ++It)
+			{
+				for (const FLoosePallet& P : It->GetLoosePallets())
+				{
+					if (P.Comp)
+					{
+						const FVector L = P.Comp->GetComponentLocation();
+						Json += FString::Printf(TEXT("%s[%s,%s,%s]"), bFirst ? TEXT("") : TEXT(","), *Num(L.X), *Num(L.Y), *Num(P.Comp->GetComponentRotation().Yaw));
+						bFirst = false;
+					}
+				}
+				bool bFirstSlot = true;
+				for (const FPalletSlot& S : It->GetSlots())
+				{
+					SlotsJson += FString::Printf(TEXT("%s{\"id\":\"%s\",\"loaded\":%d,\"x\":%s,\"y\":%s,\"yaw\":%s,\"pre_x\":%s,\"pre_y\":%s,\"pre_yaw\":%s}"),
+						bFirstSlot ? TEXT("") : TEXT(","), *S.Id.ToString(), S.bForLoaded ? 1 : 0, *Num(S.Location.X), *Num(S.Location.Y), *Num(S.PalletYawDeg),
+						*Num(S.PrePoseLocation.X), *Num(S.PrePoseLocation.Y), *Num(S.PrePoseYawDeg));
+					bFirstSlot = false;
+				}
+				break;
+			}
+			Json += FString::Printf(TEXT("],\n \"slots\": [%s],\n \"spawn\": [%s,%s,%s]\n}\n"), *SlotsJson, *Num(Forklift->GetActorLocation().X), *Num(Forklift->GetActorLocation().Y), *Num(Forklift->GetActorRotation().Yaw));
+			FFileHelper::SaveStringToFile(Json, *(LidarDumpPath() / TEXT("world.json")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		}
+		LidarDumpRows.Add(TEXT("scene,x,y,yaw,clutter,gt0..gt71 (cm, 5 deg bins from the truck heading, toward +Y)"));
+		UE_LOG(LogForkliftTwin, Log, TEXT("[LidarDump] %d scenes, %d static boxes"), LidarDumpScenes, LidarDumpStatic.Num());
+	}
+
+	bNavTest = FParse::Param(FCommandLine::Get(), TEXT("ForkliftNavTest"));
+	if (bNavTest && Forklift)
+	{
+		Forklift->bKeyboardControl = false;
+		FApp::SetUseFixedTimeStep(true);
+		FApp::SetFixedDeltaTime(1.0 / 60.0);
+		AWarehouse* WH = nullptr;
+		for (TActorIterator<AWarehouse> It(GetWorld()); It; ++It)
+		{
+			WH = *It;
+			break;
+		}
+		FPalletSlot Slot;
+		bool bStarted = false;
+		if (!WH)
+		{
+			UE_LOG(LogForkliftTwin, Error, TEXT("[NavTest] no AWarehouse in the level"));
+		}
+		else if (!Forklift->GetNav())
+		{
+			UE_LOG(LogForkliftTwin, Error, TEXT("[NavTest] forklift has no Nav component"));
+		}
+		else if (!WH->FindFreeSlot(false, Forklift->GetActorLocation(), Slot))
+		{
+			UE_LOG(LogForkliftTwin, Error, TEXT("[NavTest] no free empty-zone slot"));
+		}
+		else if (!Forklift->GetNav()->PlanRouteTo(Slot.PrePoseLocation, Slot.PrePoseYawDeg))
+		{
+			UE_LOG(LogForkliftTwin, Error, TEXT("[NavTest] PlanRouteTo failed for slot %s pre-pose %s (nav status: %s)"),
+				*Slot.Id.ToString(), *Slot.PrePoseLocation.ToString(), *Forklift->GetNav()->GetStatus());
+		}
+		else
+		{
+			bStarted = true;
+			UE_LOG(LogForkliftTwin, Log, TEXT("[NavTest] routing to slot %s pre-pose %s yaw %.1f"),
+				*Slot.Id.ToString(), *Slot.PrePoseLocation.ToString(), Slot.PrePoseYawDeg);
+		}
+		if (!bStarted)
+		{
+			bNavTest = false;
+			FPlatformMisc::RequestExitWithStatus(false, 1);   // fail fast instead of hanging with nothing left to tick
+		}
+	}
+
+	bMissionTest = FParse::Param(FCommandLine::Get(), TEXT("ForkliftMissionTest"));
+	if (bMissionTest && Forklift)
+	{
+		FApp::SetUseFixedTimeStep(true);
+		FApp::SetFixedDeltaTime(1.0 / 60.0);
+		int32 Pallets = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("MissionPallets="), Pallets);
+		int32 Available = 0;
+		for (TActorIterator<AWarehouse> It(GetWorld()); It; ++It)
+		{
+			Available = It->GetLoosePallets().Num();
+			break;
+		}
+		MissionTestExpected = Pallets > 0 ? FMath::Min(Pallets, Available) : Available;
+		FParse::Value(FCommandLine::Get(), TEXT("MissionEpisodes="), MissionEpisodes);
+		FParse::Value(FCommandLine::Get(), TEXT("MissionSeed="), MissionSeed);
+		bMissionJitter = FParse::Param(FCommandLine::Get(), TEXT("MissionJitter"));
+		MissionSpawnXf = Forklift->GetActorTransform();
+		UForkliftMissionComponent* Mission = Forklift->GetMission();
+		if (!Mission || MissionTestExpected <= 0)
+		{
+			UE_LOG(LogForkliftTwin, Error, TEXT("[MissionTest] could not start (no mission component or no loose pallets)"));
+			bMissionTest = false;
+			FPlatformMisc::RequestExitWithStatus(false, 1);
+		}
+		else
+		{
+			Mission->MaxDeliveries = MissionTestExpected;
+			Mission->StartMission();
+			UE_LOG(LogForkliftTwin, Log, TEXT("[MissionTest] started, expecting %d delivery(ies)"), MissionTestExpected);
+		}
+	}
+
 	bSelfTest = FParse::Param(FCommandLine::Get(), TEXT("ForkliftSelfTest"));
 	if (bSelfTest && Forklift)
 	{
@@ -140,6 +346,40 @@ void AForkliftGameMode::StartPlay()
 void AForkliftGameMode::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	if (!bFpsCapApplied)
+	{
+		// Interactive play was rendering uncapped (GPU pinned, machine overheating). Cap it to 30 fps unless a scripted
+		// test/data run set a fixed step, where wall-clock speed matters more than heat.
+		bFpsCapApplied = true;
+		if (!FApp::UseFixedTimeStep())
+		{
+			if (IConsoleVariable* Cvar = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS")))
+			{
+				PrevMaxFps = Cvar->GetFloat();
+				Cvar->Set(30.f, ECVF_SetByGameSetting);
+			}
+		}
+	}
+	if (bRecord && Forklift)
+	{
+		RecordTick(DeltaSeconds);
+	}
+	if (bIdentTest && Forklift)
+	{
+		IdentTestTick(DeltaSeconds);
+	}
+	if (bLidarDump && Forklift)
+	{
+		LidarDumpTick(DeltaSeconds);
+	}
+	if (bNavTest && Forklift)
+	{
+		NavTestTick(DeltaSeconds);
+	}
+	if (bMissionTest && Forklift)
+	{
+		MissionTestTick(DeltaSeconds);
+	}
 	if (bSelfTest && Forklift)
 	{
 		SelfTestTick(DeltaSeconds);
@@ -156,6 +396,717 @@ void AForkliftGameMode::Tick(float DeltaSeconds)
 	{
 		PalletTestTick(DeltaSeconds);
 	}
+	if (bAutoPickupTest && Forklift)
+	{
+		AutoPickupTestTick(DeltaSeconds);
+	}
+	else if (bAutoPickupHarness && Forklift)
+	{
+		PollAutoPickupRun(DeltaSeconds);
+	}
+}
+
+namespace
+{
+	struct FIdentSeg { float Throttle; float Steer; float Seconds; };
+	struct FIdentCase { const TCHAR* Name; TArray<FIdentSeg> Segs; };
+
+	// Open-loop step cases. Steer +1 holds the wheel at +MaxSteerDeg; steer 0 re-centres at SteerRateDegPerSec.
+	const TArray<FIdentCase>& IdentCases()
+	{
+		static const TArray<FIdentCase> Cases = {
+			{ TEXT("fwd_full"),      { {1.f, 0.f, 3.f}, {0.f, 0.f, 2.f} } },
+			{ TEXT("fwd_half"),      { {0.5f, 0.f, 4.f}, {0.f, 0.f, 2.f} } },
+			{ TEXT("rev"),           { {-0.6f, 0.f, 3.f}, {0.f, 0.f, 2.f} } },
+			{ TEXT("steer_left"),    { {0.6f, 0.f, 0.5f}, {0.6f, 1.f, 4.f}, {0.6f, 0.f, 1.5f}, {0.f, 0.f, 2.f} } },
+			{ TEXT("steer_right"),   { {0.6f, 0.f, 0.5f}, {0.6f, -1.f, 4.f}, {0.6f, 0.f, 1.5f}, {0.f, 0.f, 2.f} } },
+			{ TEXT("steer_static"),  { {0.f, 1.f, 1.f}, {0.f, 0.f, 1.f}, {0.f, -1.f, 1.f}, {0.f, 0.f, 1.f} } },
+			{ TEXT("rev_steer"),     { {-0.6f, 1.f, 4.f}, {-0.6f, 0.f, 1.f}, {0.f, 0.f, 2.f} } },
+			{ TEXT("slalom"),        { {0.7f, 1.f, 1.f}, {0.7f, -1.f, 2.f}, {0.7f, 1.f, 2.f}, {0.7f, 0.f, 1.f}, {0.f, 0.f, 2.f} } },
+			{ TEXT("brake_from_full"), { {1.f, 0.f, 2.5f}, {-1.f, 0.f, 1.5f}, {0.f, 0.f, 2.f} } },
+		};
+		return Cases;
+	}
+}
+
+void AForkliftGameMode::IdentTestTick(float DeltaSeconds)
+{
+	const TArray<FIdentCase>& Cases = IdentCases();
+	if (IdentCase >= Cases.Num())
+	{
+		UE_LOG(LogForkliftTwin, Log, TEXT("[IdentTest] PASS: wrote %d case file(s) to %s"), Cases.Num(), *(FPaths::ProjectSavedDir() / TEXT("Ident")));
+		bIdentTest = false;
+		FPlatformMisc::RequestExitWithStatus(false, 0);
+		return;
+	}
+	if (bIdentSettling)
+	{
+		// Teleport to the spawn pose with everything zeroed and let the suspension settle before each case.
+		if (IdentSettleTime == 0.f)
+		{
+			Forklift->SetActorLocationAndRotation(IdentSpawnXf.GetLocation(), IdentSpawnXf.Rotator(), false, nullptr, ETeleportType::ResetPhysics);
+		}
+		Forklift->SetDriveInput(0.f, 0.f, 0.f);
+		IdentSettleTime += DeltaSeconds;
+		if (IdentSettleTime > 2.f)
+		{
+			bIdentSettling = false;
+			IdentSeg = 0;
+			IdentSegTime = 0.f;
+			IdentTime = 0.f;
+			IdentRows.Reset();
+			IdentRows.Add(TEXT("t,x,y,yaw,speed,steer_deg,throttle_cmd,steer_cmd"));
+		}
+		return;
+	}
+	const FIdentCase& Case = Cases[IdentCase];
+	const FIdentSeg& Seg = Case.Segs[IdentSeg];
+	Forklift->SetDriveInput(Seg.Throttle, Seg.Steer, 0.f);
+	const FVector P = Forklift->GetActorLocation();
+	IdentRows.Add(FString::Printf(TEXT("%.4f,%.3f,%.3f,%.4f,%.3f,%.4f,%.3f,%.3f"), IdentTime, P.X, P.Y, Forklift->GetActorRotation().Yaw,
+		Forklift->GetForwardSpeedCmPerSec(), Forklift->GetSteerTargetDeg(), Seg.Throttle, Seg.Steer));
+	IdentTime += DeltaSeconds;
+	IdentSegTime += DeltaSeconds;
+	if (IdentSegTime >= Seg.Seconds)
+	{
+		IdentSegTime = 0.f;
+		if (++IdentSeg >= Case.Segs.Num())
+		{
+			const FString Path = FPaths::ProjectSavedDir() / TEXT("Ident") / FString::Printf(TEXT("case%d_%s.csv"), IdentCase, Case.Name);
+			FFileHelper::SaveStringToFile(FString::Join(IdentRows, TEXT("\n")), *Path);
+			UE_LOG(LogForkliftTwin, Log, TEXT("[IdentTest] case %d (%s) done: %d rows, end pos (%.1f, %.1f) yaw %.1f"),
+				IdentCase, Case.Name, IdentRows.Num() - 1, P.X, P.Y, Forklift->GetActorRotation().Yaw);
+			++IdentCase;
+			bIdentSettling = true;
+			IdentSettleTime = 0.f;
+		}
+	}
+}
+
+namespace
+{
+	// Output folder of -ForkliftRecord: Saved/Video, or Saved/<-RecordDir=name>.
+	FString RecordPath()
+	{
+		FString Dir = TEXT("Video");
+		FParse::Value(FCommandLine::Get(), TEXT("RecordDir="), Dir);
+		return FPaths::ProjectSavedDir() / Dir;
+	}
+}
+
+namespace
+{
+	// Output folder of -ForkliftLidarDump: Saved/LidarDump, or Saved/<-LidarDumpDir=name>.
+	FString LidarDumpPath()
+	{
+		FString Dir = TEXT("LidarDump");
+		FParse::Value(FCommandLine::Get(), TEXT("LidarDumpDir="), Dir);
+		return FPaths::ProjectSavedDir() / Dir;
+	}
+}
+
+namespace
+{
+	// Distance along a 2D ray (origin O, unit dir D, XY) to the nearest of the boxes; Max if none closer.
+	float RayClearance2D(const FVector2D& O, const FVector2D& D, const TArray<FBox>& Boxes, float Max)
+	{
+		float Best = Max;
+		for (const FBox& B : Boxes)
+		{
+			float T0 = 0.f, T1 = Best;
+			bool bHit = true;
+			for (int32 Axis = 0; Axis < 2 && bHit; ++Axis)
+			{
+				const float Lo = Axis == 0 ? B.Min.X : B.Min.Y;
+				const float Hi = Axis == 0 ? B.Max.X : B.Max.Y;
+				const float Oa = Axis == 0 ? O.X : O.Y;
+				const float Da = Axis == 0 ? D.X : D.Y;
+				if (FMath::Abs(Da) < 1.e-6f)
+				{
+					bHit = Oa >= Lo && Oa <= Hi;
+				}
+				else
+				{
+					float Ta = (Lo - Oa) / Da, Tb = (Hi - Oa) / Da;
+					if (Ta > Tb) { Swap(Ta, Tb); }
+					T0 = FMath::Max(T0, Ta);
+					T1 = FMath::Min(T1, Tb);
+					bHit = T0 <= T1;
+				}
+			}
+			if (bHit)
+			{
+				Best = FMath::Min(Best, T0);
+			}
+		}
+		return Best;
+	}
+}
+
+void AForkliftGameMode::LidarDumpTick(float DeltaSeconds)
+{
+	ULidarSensorComponent* Roof = Forklift->GetLidar();
+	ULidarSensorComponent* Low = Forklift->GetLowLidar();
+	if (LidarDumpScene >= LidarDumpScenes)
+	{
+		FFileHelper::SaveStringToFile(FString::Join(LidarDumpRows, TEXT("\n")), *(LidarDumpPath() / TEXT("meta.csv")));
+		UE_LOG(LogForkliftTwin, Log, TEXT("[LidarDump] PASS: %d scenes -> %s"), LidarDumpScenes, *(LidarDumpPath()));
+		bLidarDump = false;
+		FPlatformMisc::RequestExitWithStatus(false, 0);
+		return;
+	}
+	if (LidarDumpFrames == 0)
+	{
+		// New scene: a random pose in free floor (truck footprint circle clear of every static box), then clutter.
+		FVector2D Pos(0.f, 0.f);
+		for (int32 Try = 0; Try < 200; ++Try)
+		{
+			Pos = FVector2D(LidarDumpRng.FRandRange(-1650.f, 1650.f), LidarDumpRng.FRandRange(-1050.f, 1050.f));
+			bool bClear = true;
+			for (const FBox& B : LidarDumpStatic)
+			{
+				if (Pos.X > B.Min.X - 260.f && Pos.X < B.Max.X + 260.f && Pos.Y > B.Min.Y - 260.f && Pos.Y < B.Max.Y + 260.f)
+				{
+					bClear = false;
+					break;
+				}
+			}
+			if (bClear) { break; }
+		}
+		const float StartYaw = LidarDumpRng.FRandRange(-180.f, 180.f);
+		Forklift->SetActorLocationAndRotation(FVector(Pos.X, Pos.Y, 15.f), FRotator(0.f, StartYaw, 0.f), false, nullptr, ETeleportType::ResetPhysics);
+		Forklift->SetDriveInput(0.f, 0.f, 0.f);
+
+		LidarDumpBoxes = LidarDumpStatic;
+		UStaticMesh* Cube = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
+		const int32 NumClutter = LidarDumpRng.RandRange(0, 5);
+		for (int32 I = 0; I < NumClutter && Cube; ++I)
+		{
+			// Floor-level things: flat pallets, totes, cartons, a few tall posts. Placed 1.5..9 m from the truck.
+			const float Ang = LidarDumpRng.FRandRange(-PI, PI), Dist = LidarDumpRng.FRandRange(150.f, 900.f);
+			const float Kind = LidarDumpRng.FRand();
+			const FVector Size = Kind < 0.4f ? FVector(120.f, 100.f, 14.f) : (Kind < 0.75f ? FVector(60.f, 40.f, 28.f) : (Kind < 0.9f ? FVector(50.f, 40.f, 50.f) : FVector(30.f, 30.f, 180.f)));
+			const FVector Loc(Pos.X + Dist * FMath::Cos(Ang), Pos.Y + Dist * FMath::Sin(Ang), Size.Z * 0.5f);
+			const FRotator Rot(0.f, LidarDumpRng.FRandRange(0.f, 180.f), 0.f);
+			if (FMath::Abs(Loc.X) > 1700.f || FMath::Abs(Loc.Y) > 1100.f)
+			{
+				continue;
+			}
+			bool bOverlap = false;
+			const FBox Fp(Loc - FVector(Size.X, Size.Y, 0.f) * 0.75f, Loc + FVector(Size.X, Size.Y, 0.f) * 0.75f);
+			for (const FBox& B : LidarDumpBoxes)
+			{
+				if (FMath::Min(B.Max.X, Fp.Max.X) > FMath::Max(B.Min.X, Fp.Min.X) && FMath::Min(B.Max.Y, Fp.Max.Y) > FMath::Max(B.Min.Y, Fp.Min.Y))
+				{
+					bOverlap = true;
+					break;
+				}
+			}
+			if (bOverlap) { continue; }
+			AStaticMeshActor* A = GetWorld()->SpawnActor<AStaticMeshActor>(Loc, Rot);
+			if (!A) { continue; }
+			A->SetMobility(EComponentMobility::Movable);
+			A->GetStaticMeshComponent()->SetStaticMesh(Cube);
+			A->SetActorScale3D(Size / 100.f);
+			A->GetStaticMeshComponent()->SetCollisionProfileName(TEXT("BlockAll"));
+			LidarDumpClutter.Add(A);
+			// Conservative axis-aligned bound of the rotated box for the 2D ground truth (slightly pessimistic when rotated).
+			const float R = FMath::Abs(FMath::Cos(FMath::DegreesToRadians(Rot.Yaw))), S = FMath::Abs(FMath::Sin(FMath::DegreesToRadians(Rot.Yaw)));
+			const FVector2D Half(0.5f * (Size.X * R + Size.Y * S), 0.5f * (Size.X * S + Size.Y * R));
+			LidarDumpBoxes.Add(FBox(FVector(Loc.X - Half.X, Loc.Y - Half.Y, 0.f), FVector(Loc.X + Half.X, Loc.Y + Half.Y, Size.Z)));
+		}
+	}
+	++LidarDumpFrames;
+	int32 SettleFrames = 45;
+	FParse::Value(FCommandLine::Get(), TEXT("LidarDumpSettle="), SettleFrames);
+	if (LidarDumpFrames < SettleFrames)
+	{
+		return;   // let the teleported body settle and the new colliders register
+	}
+	Roof->Scan();
+	Low->Scan();
+	const FVector P = Forklift->GetActorLocation();
+	const float Yaw = Forklift->GetActorRotation().Yaw;
+	FString Row = FString::Printf(TEXT("%d,%.2f,%.2f,%.3f,%d"), LidarDumpScene, P.X, P.Y, Yaw, LidarDumpClutter.Num());
+	for (int32 K = 0; K < 72; ++K)
+	{
+		const float A = FMath::DegreesToRadians(Yaw + K * 5.f);
+		Row += FString::Printf(TEXT(",%.1f"), RayClearance2D(FVector2D(P.X, P.Y), FVector2D(FMath::Cos(A), FMath::Sin(A)), LidarDumpBoxes, 3000.f));
+	}
+	LidarDumpRows.Add(Row);
+	const FString Base = LidarDumpPath() / FString::Printf(TEXT("scene%03d"), LidarDumpScene);
+	Roof->SaveRangesNpy(Base + TEXT("_roof.npy"));
+	Low->SaveRangesNpy(Base + TEXT("_low.npy"));
+	UE_LOG(LogForkliftTwin, Log, TEXT("[LidarDump] scene %d at (%.0f, %.0f) yaw %.0f with %d clutter; roof %d returns, low %d returns"),
+		LidarDumpScene, P.X, P.Y, Yaw, LidarDumpClutter.Num(), Roof->GetPointsRef().Num(), Low->GetPointsRef().Num());
+	for (const TWeakObjectPtr<AActor>& A : LidarDumpClutter)
+	{
+		if (A.IsValid()) { A->Destroy(); }
+	}
+	LidarDumpClutter.Reset();
+	LidarDumpFrames = 0;
+	++LidarDumpScene;
+}
+
+void AForkliftGameMode::RecordSetup()
+{
+	FApp::SetUseFixedTimeStep(true);
+	FApp::SetFixedDeltaTime(1.0 / 60.0);
+	constexpr int32 W = 960, H = 540;
+	float RecordEV = 3.5f;   // -RecordEV=: manual exposure of the scene-capture cameras
+	FParse::Value(FCommandLine::Get(), TEXT("RecordEV="), RecordEV);
+	RecordNames = { TEXT("chase"), TEXT("top"), TEXT("side"), TEXT("wide") };
+	for (const FString& Name : RecordNames)
+	{
+		UTextureRenderTarget2D* Target = NewObject<UTextureRenderTarget2D>(this);
+		Target->InitCustomFormat(W, H, PF_B8G8R8A8, false);
+		Target->UpdateResourceImmediate(true);
+		ASceneCapture2D* Cap = GetWorld()->SpawnActor<ASceneCapture2D>(FVector::ZeroVector, FRotator::ZeroRotator);
+		USceneCaptureComponent2D* Comp = Cap->GetCaptureComponent2D();
+		Comp->TextureTarget = Target;
+		Comp->CaptureSource = SCS_FinalColorLDR;
+		Comp->bCaptureEveryFrame = false;
+		Comp->bCaptureOnMovement = false;
+		Comp->FOVAngle = Name == TEXT("top") ? 80.f : (Name == TEXT("wide") ? 85.f : 65.f);
+		// Fixed exposure, as in CaptureShot: a fresh capture has no eye-adaptation history.
+		Comp->PostProcessSettings.bOverride_AutoExposureMethod = true;
+		Comp->PostProcessSettings.AutoExposureMethod = AEM_Manual;
+		Comp->PostProcessSettings.bOverride_AutoExposureBias = true;
+		Comp->PostProcessSettings.AutoExposureBias = RecordEV;
+		// Exposure overrides on a capture are ignored unless it keeps its rendering state (see ForkliftVehicle's camera
+		// constructors): switch that on and re-register so the manual exposure actually applies.
+		Comp->bAlwaysPersistRenderingState = true;
+		Comp->UnregisterComponent();
+		Comp->RegisterComponent();
+		RecordCams.Add(Cap);
+		RecordTargets.Add(Target);
+		IFileManager::Get().MakeDirectory(*(RecordPath() / Name), true);
+	}
+	IFileManager::Get().MakeDirectory(*(RecordPath() / TEXT("tine")), true);
+	RecordSidePos = Forklift->GetActorLocation() + Forklift->GetActorRightVector() * 550.f + FVector(0.f, 0.f, 160.f);
+	RecordCaptions.Add(TEXT("frame,sim_t,mission,nav,pickup"));
+	UE_LOG(LogForkliftTwin, Log, TEXT("[Record] %d cameras at %.0f fps -> %s"), RecordNames.Num() + 1, RecordFps, *(RecordPath()));
+}
+
+void AForkliftGameMode::RecordFlushCaptions()
+{
+	if (RecordSensorLines.Num() > 0)
+	{
+		FFileHelper::SaveStringToFile(FString::Join(RecordSensorLines, TEXT("\n")) + TEXT("\n"), *(RecordPath() / TEXT("sensors.jsonl")),
+			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM, &IFileManager::Get(), FILEWRITE_Append);
+		RecordSensorLines.Reset();
+	}
+	FFileHelper::SaveStringToFile(FString::Join(RecordCaptions, TEXT("\n")), *(RecordPath() / TEXT("captions.csv")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+}
+
+void AForkliftGameMode::RecordTick(float DeltaSeconds)
+{
+	RecordAccum += DeltaSeconds;
+	const float Period = 1.f / FMath::Max(RecordFps, 1.f);
+	if (RecordAccum < Period)
+	{
+		return;
+	}
+	RecordAccum -= Period;
+
+	const FVector Truck = Forklift->GetActorLocation();
+	const FVector Fwd = Forklift->GetActorForwardVector();
+	const FVector Look = Truck + FVector(0.f, 0.f, 90.f);
+	const auto LookAt = [](const FVector& From, const FVector& To) { return (To - From).Rotation(); };
+
+	// Camera poses (cm). Side camera follows the truck smoothly from a fixed side offset instead of being rigid.
+	RecordSidePos = FMath::Lerp(RecordSidePos, Truck + FVector(0.f, -600.f, 170.f), 0.06f);
+	const FVector Poses[4] = {
+		Truck - Fwd * 520.f + FVector(0.f, 0.f, 560.f),   // chase
+		Truck + FVector(0.f, 0.f, 820.f),                 // top (under the 9 m ceiling)
+		RecordSidePos,                                    // side
+		FVector(900.f, 1000.f, 520.f),                    // wide: fixed corner overview of the pickup zone
+	};
+	const FVector Targets[4] = { Look, Truck, Look, FVector(-300.f, 250.f, 40.f) };
+	for (int32 I = 0; I < RecordCams.Num(); ++I)
+	{
+		FRotator Rot = LookAt(Poses[I], Targets[I]);
+		if (RecordNames[I] == TEXT("top"))
+		{
+			Rot = FRotator(-90.f, Forklift->GetActorRotation().Yaw, 0.f);   // straight down, truck heading up the screen
+		}
+		RecordCams[I]->SetActorLocationAndRotation(Poses[I], Rot);
+		RecordCams[I]->GetCaptureComponent2D()->CaptureScene();
+	}
+	if (UForkliftCameraComponent* Tine = Forklift->GetTineCamera())
+	{
+		Tine->Capture();
+	}
+	FlushRenderingCommands();
+
+	IImageWrapperModule& Wrappers = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	const auto SaveJpeg = [&](const TArray<FColor>& Pixels, int32 W, int32 H, const FString& Path)
+	{
+		TSharedPtr<IImageWrapper> Wrapper = Wrappers.CreateImageWrapper(EImageFormat::JPEG);
+		if (Wrapper.IsValid() && Wrapper->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), W, H, ERGBFormat::BGRA, 8))
+		{
+			FFileHelper::SaveArrayToFile(Wrapper->GetCompressed(88), *Path);
+		}
+	};
+	for (int32 I = 0; I < RecordCams.Num(); ++I)
+	{
+		TArray<FColor> Pixels;
+		RecordTargets[I]->GameThread_GetRenderTargetResource()->ReadPixels(Pixels);
+		for (FColor& C : Pixels) { C.A = 255; }
+		SaveJpeg(Pixels, RecordTargets[I]->SizeX, RecordTargets[I]->SizeY,
+			RecordPath() / RecordNames[I] / FString::Printf(TEXT("f%05d.jpg"), RecordFrame));
+	}
+	if (UForkliftCameraComponent* Tine = Forklift->GetTineCamera())
+	{
+		TArray<FColor> Pixels;
+		if (Tine->ReadPixelsBgra(Pixels))
+		{
+			for (FColor& C : Pixels) { C.A = 255; }
+			SaveJpeg(Pixels, Tine->Width, Tine->Height, RecordPath() / TEXT("tine") / FString::Printf(TEXT("f%05d.jpg"), RecordFrame));
+		}
+	}
+
+	// Sensor sidecar for the video overlay: lidar returns in the sensor frame (roof: every 3rd ray, low: all) and the
+	// tine detector's current boxes, so make_video.py can draw the radar and detections exactly as the truck saw them.
+	{
+		FString Line = FString::Printf(TEXT("{\"f\":%d,\"roof\":["), RecordFrame);
+		ULidarSensorComponent* Roof = Forklift->GetLidar();
+		ULidarSensorComponent* Low = Forklift->GetLowLidar();
+		if (Low) { Low->Scan(); }
+		bool bFirst = true;
+		if (Roof)
+		{
+			const TArray<FVector>& Pts = Roof->GetPointsRef();
+			for (int32 I = 0; I < Pts.Num(); I += 3)
+			{
+				Line += FString::Printf(TEXT("%s%d,%d,%d"), bFirst ? TEXT("") : TEXT(","), FMath::RoundToInt(Pts[I].X), FMath::RoundToInt(Pts[I].Y), FMath::RoundToInt(Pts[I].Z));
+				bFirst = false;
+			}
+		}
+		Line += TEXT("],\"low\":[");
+		bFirst = true;
+		if (Low)
+		{
+			for (const FVector& P : Low->GetPointsRef())
+			{
+				Line += FString::Printf(TEXT("%s%d,%d,%d"), bFirst ? TEXT("") : TEXT(","), FMath::RoundToInt(P.X), FMath::RoundToInt(P.Y), FMath::RoundToInt(P.Z));
+				bFirst = false;
+			}
+		}
+		Line += TEXT("],\"det\":[");
+		const UForkliftAutoPickupComponent* AutoRec = Forklift->GetAutoPickup();
+		const UForkliftDetectionClient* Det = AutoRec ? AutoRec->GetDetector() : nullptr;
+		int32 DetW = 0, DetH = 0;
+		if (Det)
+		{
+			DetW = Det->GetImageWidth();
+			DetH = Det->GetImageHeight();
+			bFirst = true;
+			for (const FForkliftDetectionBox& B : Det->GetBoxes())
+			{
+				Line += FString::Printf(TEXT("%s[\"%s\",%.2f,%.0f,%.0f,%.0f,%.0f]"), bFirst ? TEXT("") : TEXT(","), *B.ClassName, B.Confidence, B.X1, B.Y1, B.X2, B.Y2);
+				bFirst = false;
+			}
+		}
+		Line += FString::Printf(TEXT("],\"det_wh\":[%d,%d]}"), DetW, DetH);
+		RecordSensorLines.Add(Line);
+	}
+
+	const UForkliftMissionComponent* Mission = Forklift->GetMission();
+	const UForkliftNavComponent* Nav = Forklift->GetNav();
+	const UForkliftAutoPickupComponent* Auto = Forklift->GetAutoPickup();
+	RecordCaptions.Add(FString::Printf(TEXT("%d,%.2f,\"%s\",\"%s\",\"%s\""), RecordFrame, RecordFrame / RecordFps,
+		Mission ? *Mission->GetStatus().Replace(TEXT("\""), TEXT("'")) : TEXT(""),
+		Nav && Nav->IsBusy() ? *Nav->GetStatus().Replace(TEXT("\""), TEXT("'")) : TEXT(""),
+		Auto && Auto->IsPickupActive() ? *Auto->GetStatus().Replace(TEXT("\""), TEXT("'")) : TEXT("")));
+	++RecordFrame;
+	if (RecordFrame % 24 == 0)
+	{
+		RecordFlushCaptions();
+	}
+}
+
+void AForkliftGameMode::AutoPickupTestTick(float DeltaSeconds)
+{
+	AutoPickupTestTime += DeltaSeconds;
+	if (AutoPickupTestTime < 1.f && AutoPickupPallet.IsValid())
+	{
+		// Refresh while the pallet settles onto the floor; this is the actual lift baseline.
+		AutoPickupPalletStartZ = AutoPickupPallet->GetComponentLocation().Z;
+	}
+	UForkliftAutoPickupComponent* Auto = Forklift->GetAutoPickup();
+	if (!Auto)
+	{
+		UE_LOG(LogForkliftTwin, Error, TEXT("[AutoPickupTest] controller missing"));
+		FPlatformMisc::RequestExitWithStatus(false, 2);
+		return;
+	}
+	const EAutoPickupState State = Auto->GetState();
+	if (State == EAutoPickupState::Complete || State == EAutoPickupState::Aborted)
+	{
+		const float PalletRiseCm = AutoPickupPallet.IsValid() ? AutoPickupPallet->GetComponentLocation().Z - AutoPickupPalletStartZ : -1.f;
+		const bool bLoadRaised = PalletRiseCm >= 20.f;
+		const bool bPassed = State == EAutoPickupState::Complete && bLoadRaised;
+		if (AutoPickupPallet.IsValid())
+		{
+			const FVector PalletLocal = Forklift->GetActorTransform().InverseTransformPosition(AutoPickupPallet->GetComponentLocation());
+			UE_LOG(LogForkliftTwin, Log, TEXT("[AutoPickupTest] final truck=%s yaw=%.1f lift=%.1f tip=%s palletLocal=%s palletRot=%s"),
+				*Forklift->GetActorLocation().ToString(), Forklift->GetActorRotation().Yaw, Forklift->GetLiftHeightCm(),
+				*Forklift->GetActorTransform().InverseTransformPosition(Forklift->GetForkTipWorld()).ToString(), *PalletLocal.ToString(),
+				*AutoPickupPallet->GetComponentRotation().ToString());
+		}
+		if (UForkliftCameraComponent* TineCam = Forklift->GetTineCamera())
+		{
+			TineCam->Capture();
+			FlushRenderingCommands();
+			TineCam->SavePng(FPaths::ProjectSavedDir() / TEXT("SensorTest/auto_pick_final.png"));
+		}
+		if (bPassed)
+		{
+			UE_LOG(LogForkliftTwin, Log, TEXT("[AutoPickupTest] %s | pallet rise %.1f cm (PASS)"), *Auto->GetStatus(), PalletRiseCm);
+		}
+		else
+		{
+			UE_LOG(LogForkliftTwin, Error, TEXT("[AutoPickupTest] %s | pallet rise %.1f cm (FAIL)"), *Auto->GetStatus(), PalletRiseCm);
+		}
+		FinishAutoPickupTest(bPassed ? 0 : (State == EAutoPickupState::Aborted ? 3 : 5), bPassed, PalletRiseCm, Auto->GetStatus());
+	}
+	else if (AutoPickupTestTime > 55.f)
+	{
+		Auto->AbortPickup(TEXT("test harness timeout"));
+		UE_LOG(LogForkliftTwin, Error, TEXT("[AutoPickupTest] %s"), *Auto->GetStatus());
+		FinishAutoPickupTest(4, false, -1.f, Auto->GetStatus());
+	}
+}
+
+FString AForkliftGameMode::ReadAutoPickupCaseArgs() const
+{
+	// Case parameters (PickupOffsetY=<cm> PickupYawDeg=<deg> PickupBackCm=<cm run-up>) come from the command line and,
+	// so that one already-open editor can run many cases, from Saved/AutoPickupCase.txt (same syntax).
+	FString Args = FCommandLine::Get();
+	FString FromFile;
+	if (FFileHelper::LoadFileToString(FromFile, *(FPaths::ProjectSavedDir() / TEXT("AutoPickupCase.txt"))))
+	{
+		Args += TEXT(" ") + FromFile;
+	}
+	return Args;
+}
+
+void AForkliftGameMode::PlaceAutoPickupCase(const FString& Args)
+{
+	float PickupOffsetY = 0.f, PickupYawDeg = 0.f, PickupBackCm = 0.f;
+	FParse::Value(*Args, TEXT("PickupOffsetY="), PickupOffsetY);
+	FParse::Value(*Args, TEXT("PickupYawDeg="), PickupYawDeg);
+	FParse::Value(*Args, TEXT("PickupBackCm="), PickupBackCm);
+	Forklift->SetActorLocationAndRotation(FVector(PickupBackCm, -250.f + PickupOffsetY, 15.f), FRotator(0.f, 180.f + PickupYawDeg, 0.f), false, nullptr, ETeleportType::ResetPhysics);
+	if (UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(Forklift->GetRootComponent()))
+	{
+		Body->SetPhysicsLinearVelocity(FVector::ZeroVector);
+		Body->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
+	}
+}
+
+void AForkliftGameMode::PollAutoPickupRun(float DeltaSeconds)
+{
+	// Editor batch mode (Content/Python/init_unreal.py): a new case is requested by writing Saved/AutoPickupRun.txt.
+	// The scene is reset inside the running Play session (ending Play between cases crashes UnrealEd here).
+	const FString RunFile = FPaths::ProjectSavedDir() / TEXT("AutoPickupRun.txt");
+	UForkliftAutoPickupComponent* Auto = Forklift->GetAutoPickup();
+	if (!Auto)
+	{
+		return;
+	}
+	if (!bAutoPickupResetting)
+	{
+		if (!IFileManager::Get().FileExists(*RunFile))
+		{
+			return;
+		}
+		IFileManager::Get().Delete(*RunFile);
+		if (AutoPickupPallet.IsValid())
+		{
+			AutoPickupPallet->SetWorldTransform(AutoPickupPalletHome, false, nullptr, ETeleportType::ResetPhysics);
+			AutoPickupPallet->SetPhysicsLinearVelocity(FVector::ZeroVector);
+			AutoPickupPallet->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
+		}
+		PlaceAutoPickupCase(ReadAutoPickupCaseArgs());
+		Forklift->bKeyboardControl = false;
+		bAutoPickupResetting = true;
+		AutoPickupResetTime = 0.f;
+		return;
+	}
+
+	// Lower the lift and centre the steering, then let everything settle before the controller starts.
+	AutoPickupResetTime += DeltaSeconds;
+	const float LiftError = Forklift->GetLiftMinCm() - Forklift->GetLiftHeightCm();
+	Forklift->SetDriveInput(0.f, FMath::Clamp(-Forklift->GetSteerTargetDeg() / 15.f, -0.5f, 0.5f), FMath::Clamp(LiftError / 5.f, -1.f, 0.f));
+	if (AutoPickupResetTime > 1.5f && LiftError > -1.f && FMath::Abs(Forklift->GetSteerTargetDeg()) < 1.f)
+	{
+		Forklift->SetDriveInput(0.f, 0.f, 0.f);
+		if (AutoPickupPallet.IsValid())
+		{
+			AutoPickupPalletStartZ = AutoPickupPallet->GetComponentLocation().Z;
+		}
+		bAutoPickupResetting = false;
+		AutoPickupTestTime = 0.f;
+		bAutoPickupTest = true;
+		Auto->StartPickup();
+	}
+}
+
+void AForkliftGameMode::FinishAutoPickupTest(int32 ExitCode, bool bPassed, float RiseCm, const FString& Status)
+{
+	if ((GetWorld() && GetWorld()->WorldType == EWorldType::PIE))
+	{
+		// Keep the editor open: record the result for the Python batch driver (Content/Python/init_unreal.py), which
+		// ends Play and starts the next case. Stop ticking the test so it reports once.
+		bAutoPickupTest = false;
+		const FString Line = FString::Printf(TEXT("%s rise=%.1f status=%s"), bPassed ? TEXT("PASS") : TEXT("FAIL"), RiseCm, *Status);
+		FFileHelper::SaveStringToFile(Line, *(FPaths::ProjectSavedDir() / TEXT("AutoPickupResult.txt")));
+		return;
+	}
+	FPlatformMisc::RequestExitWithStatus(false, ExitCode);
+}
+
+void AForkliftGameMode::MissionTestTick(float DeltaSeconds)
+{
+	UForkliftMissionComponent* Mission = Forklift->GetMission();
+
+	if (bMissionResetting)
+	{
+		// Between episodes: lower the lift, centre the steering and let the reset pallets settle before restarting.
+		MissionResetTime += DeltaSeconds;
+		const float LiftError = Forklift->GetLiftMinCm() - Forklift->GetLiftHeightCm();
+		Forklift->SetDriveInput(0.f, FMath::Clamp(-Forklift->GetSteerTargetDeg() / 15.f, -0.5f, 0.5f), FMath::Clamp(LiftError / 5.f, -1.f, 0.f));
+		if (MissionResetTime > 2.5f)
+		{
+			bMissionResetting = false;
+			MissionTestTime = 0.f;
+			MissionTestLastLoggedState = -1;
+			Mission->EpisodeIndex = MissionEpisode;
+			Mission->StartMission();
+			UE_LOG(LogForkliftTwin, Log, TEXT("[MissionTest] episode %d started"), MissionEpisode);
+		}
+		return;
+	}
+
+	MissionTestTime += DeltaSeconds;
+	const int32 CurrentState = static_cast<int32>(Mission->GetState());
+	if (CurrentState != MissionTestLastLoggedState)
+	{
+		MissionTestLastLoggedState = CurrentState;
+		UE_LOG(LogForkliftTwin, Log, TEXT("[MissionTest] t=%.1f %s truck=%s"), MissionTestTime, *Mission->GetStatus(), *Forklift->GetActorLocation().ToString());
+	}
+
+	const EMissionState S = Mission->GetState();
+	const bool bTimedOut = MissionTestTime > 1500.f * FMath::Max(1, MissionTestExpected);
+	if (bTimedOut && Mission->IsMissionActive())
+	{
+		Mission->AbortMission(TEXT("harness timeout"));
+		return;
+	}
+	if (S != EMissionState::Complete && S != EMissionState::Failed && S != EMissionState::Idle)
+	{
+		return;
+	}
+
+	// The episode is over: score it.
+	const bool bPassed = S == EMissionState::Complete && Mission->GetDeliveredCount() >= MissionTestExpected;
+	if (bPassed)
+	{
+		++MissionEpisodesPassed;
+	}
+	UE_LOG(LogForkliftTwin, Log, TEXT("[MissionTest] episode %d %s | %s | delivered %d of %d in %.0f sim-s | running mean score %.1f over %d deliveries"),
+		MissionEpisode, bPassed ? TEXT("PASS") : TEXT("FAIL"), *Mission->GetStatus(), Mission->GetDeliveredCount(), MissionTestExpected,
+		MissionTestTime, Mission->GetMeanScore(), Mission->GetRecords().Num());
+	{
+		FString Line = FString::Printf(TEXT("{\"episode\":%d,\"pass\":%s,\"delivered\":%d,\"expected\":%d,\"sim_sec\":%.1f,\"mean_score\":%.2f,\"status\":\"%s\"}\n"),
+			MissionEpisode, bPassed ? TEXT("true") : TEXT("false"), Mission->GetDeliveredCount(), MissionTestExpected, MissionTestTime,
+			Mission->GetMeanScore(), *Mission->GetStatus().ReplaceCharWithEscapedChar());
+		const FString Dir = FPaths::ProjectSavedDir() / TEXT("Missions");
+		IFileManager::Get().MakeDirectory(*Dir, true);
+		FFileHelper::SaveStringToFile(Line, *(Dir / TEXT("episodes.jsonl")), FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM, &IFileManager::Get(), FILEWRITE_Append);
+	}
+
+	++MissionEpisode;
+	if (MissionEpisodes > 0 && MissionEpisode >= MissionEpisodes)
+	{
+		const bool bAllPassed = MissionEpisodesPassed == MissionEpisodes;
+		UE_LOG(LogForkliftTwin, Log, TEXT("[MissionTest] FINISHED: %d of %d episodes passed, mean delivery score %.1f (%s)"),
+			MissionEpisodesPassed, MissionEpisodes, Mission->GetMeanScore(), bAllPassed ? TEXT("PASS") : TEXT("FAIL"));
+		FPlatformMisc::RequestExitWithStatus(false, bAllPassed ? 0 : 5);
+		return;
+	}
+
+	// Next episode: put the pallets and the truck back, then let the reset block above start it.
+	Mission->ResetForNewEpisode();
+	for (TActorIterator<AWarehouse> It(GetWorld()); It; ++It)
+	{
+		It->ResetLoosePallets(bMissionJitter, MissionSeed + MissionEpisode);
+		break;
+	}
+	Forklift->SetActorLocationAndRotation(MissionSpawnXf.GetLocation(), MissionSpawnXf.Rotator(), false, nullptr, ETeleportType::ResetPhysics);
+	if (UPrimitiveComponent* Body = Cast<UPrimitiveComponent>(Forklift->GetRootComponent()))
+	{
+		Body->SetPhysicsLinearVelocity(FVector::ZeroVector);
+		Body->SetPhysicsAngularVelocityInDegrees(FVector::ZeroVector);
+	}
+	Forklift->bKeyboardControl = false;
+	bMissionResetting = true;
+	MissionResetTime = 0.f;
+}
+
+void AForkliftGameMode::NavTestTick(float DeltaSeconds)
+{
+	NavTestTime += DeltaSeconds;
+	UForkliftNavComponent* Nav = Forklift->GetNav();
+	if (!Nav)
+	{
+		UE_LOG(LogForkliftTwin, Error, TEXT("[NavTest] nav component missing"));
+		FPlatformMisc::RequestExitWithStatus(false, 2);
+		return;
+	}
+	const int32 CurrentState = static_cast<int32>(Nav->GetState());
+	if (CurrentState != NavTestLastLoggedState)
+	{
+		NavTestLastLoggedState = CurrentState;
+		UE_LOG(LogForkliftTwin, Log, TEXT("[NavTest] t=%.1f %s truck=%s"), NavTestTime, *Nav->GetStatus(), *Forklift->GetActorLocation().ToString());
+	}
+	if (Nav->GetState() == ENavState::Arrived)
+	{
+		UE_LOG(LogForkliftTwin, Log, TEXT("[NavTest] %s at t=%.1fs (PASS)"), *Nav->GetStatus(), NavTestTime);
+		FPlatformMisc::RequestExitWithStatus(false, 0);
+	}
+	else if (Nav->GetState() == ENavState::Failed)
+	{
+		UE_LOG(LogForkliftTwin, Error, TEXT("[NavTest] %s at t=%.1fs (FAIL)"), *Nav->GetStatus(), NavTestTime);
+		FPlatformMisc::RequestExitWithStatus(false, 3);
+	}
+	else if (NavTestTime > 220.f)   // safety net above UForkliftNavComponent's own RouteTimeoutSec
+	{
+		UE_LOG(LogForkliftTwin, Error, TEXT("[NavTest] harness timeout: %s (FAIL)"), *Nav->GetStatus());
+		FPlatformMisc::RequestExitWithStatus(false, 4);
+	}
+}
+
+void AForkliftGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if ((GetWorld() && GetWorld()->WorldType == EWorldType::PIE))
+	{
+		FApp::SetUseFixedTimeStep(false);  // the tests force a fixed step; do not leave the editor stuck on it
+	}
+	if (bFpsCapApplied && !FApp::UseFixedTimeStep())
+	{
+		if (IConsoleVariable* Cvar = IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS")))
+		{
+			Cvar->Set(PrevMaxFps, ECVF_SetByGameSetting);
+		}
+	}
+	if (bRecord)
+	{
+		RecordFlushCaptions();
+	}
+	Super::EndPlay(EndPlayReason);
 }
 
 void AForkliftGameMode::LogPalletState(const TCHAR* Tag)
@@ -419,13 +1370,17 @@ void AForkliftGameMode::SensorTestTick(float DeltaSeconds)
 void AForkliftGameMode::DumpSensors(const TCHAR* Tag)
 {
 	UForkliftCameraComponent* Cam = Forklift->GetForkCamera();
+	UForkliftCameraComponent* TineCam = Forklift->GetTineCamera();
 	ULidarSensorComponent* Lidar = Forklift->GetLidar();
 	Cam->Capture();
+	TineCam->Capture();
 	Lidar->Scan();
 	FlushRenderingCommands();
 
 	const FString Base = SensorTestDir / Tag;
 	const bool bPng = Cam->SavePng(Base + TEXT("_camera.png"));
+	const bool bTinePng = TineCam->SavePng(Base + TEXT("_tine_camera.png"));
+	const bool bTineDepth = TineCam->SaveDepthNpy(Base + TEXT("_tine_depth.npy"), true);
 	const bool bRanges = Lidar->SaveRangesNpy(Base + TEXT("_lidar_ranges.npy"));
 	const bool bPoints = Lidar->SavePointsNpy(Base + TEXT("_lidar_points.npy"));
 
@@ -449,8 +1404,9 @@ void AForkliftGameMode::DumpSensors(const TCHAR* Tag)
 	}
 	const FVector CamPos = Cam->GetComponentLocation();
 	UE_LOG(LogForkliftTwin, Log,
-		TEXT("[SensorTest] %s: lift=%.1f cm  camera %dx%d z=%.1f cm mean=%.1f/255 png=%d | lidar %d returns of %d rays, range %.0f..%.0f cm, scan %.2f ms npy=%d/%d -> %s"),
+		TEXT("[SensorTest] %s: lift=%.1f cm  overview %dx%d z=%.1f mean=%.1f png=%d | tine RGB-D z=%.1f png/depth=%d/%d | lidar %d/%d range %.0f..%.0f cm %.2f ms npy=%d/%d -> %s"),
 		Tag, Forklift->GetLiftHeightCm(), Cam->Width, Cam->Height, CamPos.Z, Pixels.Num() ? Sum / Pixels.Num() : -1.0, bPng,
+		TineCam->GetComponentLocation().Z, bTinePng, bTineDepth,
 		Lidar->GetPointsRef().Num(), Lidar->GetRangesCm().Num(), MinR, MaxR, Lidar->GetScanCostMs(), bRanges, bPoints, *SensorTestDir);
 }
 

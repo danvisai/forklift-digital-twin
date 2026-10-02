@@ -1,6 +1,6 @@
 # Handoff — forklift ML detection pipeline
 
-Snapshot as of **2026-09-22**, end of session. Read this before `README.md` if you're picking this
+Snapshot as of **2026-09-26**, end of session. Read this before `README.md` if you're picking this
 project back up — it's the "what's actually going on right now" doc; the README is the reference
 manual. Everything below lives in `unreal/ForkliftTwin/`, which is **untracked by git** (`?? unreal/`
 at repo root) — nothing here is committed yet.
@@ -8,21 +8,92 @@ at repo root) — nothing here is committed yet.
 ## TL;DR
 
 Goal: teach an ML model to find pallets (empty/loaded), their fork pockets, totes and racks from the
-forklift's own camera, as a first step toward automated pick-and-place. Sensors, a synthetic-data
-generator, a trained detector, and a live in-game overlay are all working. The forklift's own physical
-pallet pickup is **not** working yet, but that doesn't block anything above — the data generator places
-pallets directly in the scene, it never needs the forklift to actually lift one.
+forklift's cameras, and use those detections for a full autonomous mission (find → navigate → pick up
+→ carry → place). Sensors, a synthetic-data generator, a trained detector, live overlays, a low RGB-D
+tine camera, and an align/insert/lift controller are working. **No ML/detector training has happened
+since 2026-09-22** (v2, `pallet_demo_v2` weights, is still the current model) — this session's work was
+all on the pickup controller and warehouse layout, in C++, not the training pipeline.
+
+## Session 2026-09-26: drop zones, pathfinding decision, closed-loop insertion
+
+1. **Warehouse drop slots** (`Warehouse.h/.cpp`, `FPalletSlot`): a west zone (x=-12 m, blue pads) for
+   empty pallets and an east zone (x=+12 m, green pads) for loaded ones, 4 slots each, 2 m pitch. Each
+   slot carries a final pose and a pre-pose `PrePoseStandOffCm` (350 cm) back toward the aisle. API:
+   `GetSlots()`, `GetSlotsFor(bLoaded)`, `IsSlotOccupied(slot)`, `FindFreeSlot(bLoaded, from, out)`. Two
+   rows per zone line up with the rack banks on purpose, so a router has to go around them. **Not wired
+   into anything yet** — no planner reads these slots, they just exist and render.
+2. **Pathfinding decision (design only, no code)** — see `RESEARCH_HANDOFF.md`'s "Decision (2026-09-25):
+   pathfinding approach" section for the full writeup. Researched what NVIDIA's own Isaac stack actually
+   uses (Nav2 Smac Hybrid-A*, opennav_docking, nvblox, FoundationPose) rather than guessing. Landed on:
+   classical Hybrid-A* (Reeds-Shepp motion, footprint collision check) for the global route to a slot's
+   pre-pose, pure pursuit to follow it, lidar built into a local costmap as a safety/replan layer (it
+   can't see floor-level pallets close-up — that stays on the tine depth camera + detector), and learning
+   introduced only later, narrowly, for final alignment/placement residuals. **No planner/tracker code
+   exists yet** — next concrete step if this is picked back up.
+3. **Closed-loop pallet insertion** (`ForkliftAutoPickupComponent.h/.cpp`) — the actual code change this
+   session. The old controller went blind at insertion (pure odometry, no yaw correction), which matched
+   the known 20-25° skew failure in the pallet test. Now:
+   - The pallet's insertion axis is tracked as a **world-frame yaw** (`PalletAxisYawWorld`), not a
+     per-frame camera-relative angle, so it survives the truck turning and the pockets leaving view.
+   - Yaw is estimated from `EstimateFaceYawDeg`: a line fit (3-pass, outlier-trimmed) across the *whole*
+     pallet-face depth profile (~120 cm wide), not just two pocket-depth samples ~40 cm apart — far less
+     noisy (was reading 15-22° for an actual 8° error).
+   - During `Inserting`, pure pursuit steers the tine tips onto that axis using `CrossTrackCm` +
+     `LastYawErrorDeg`, instead of driving straight and hoping.
+   - New `EAutoPickupState::Withdrawing`: if cross-track exceeds `InsertionCrossTrackAbortCm` (10 cm) or
+     yaw exceeds `InsertionYawAbortDeg` (9°) after 15 cm of travel, the truck backs straight out instead
+     of ramming in skewed.
+   - Modeled on the Nav2 `opennav_docking` pattern (stay closed-loop through contact, don't switch to
+     open-loop odometry once "aligned") — see the research summary in the conversation, not yet copied
+     into a doc file.
+4. **Test harness rework** — `-ForkliftAutoPickupTest` now takes `-PickupOffsetY=<cm>`,
+   `-PickupYawDeg=<deg>`, `-PickupBackCm=<cm run-up>` (`ForkliftGameMode.cpp`) for reproducible
+   misalignment cases. Running each case as a fresh `-game` process works but is slow/noisy; running
+   each as a fresh Editor process crashes UnrealEd on shutdown-after-PIE when scripted. Fixed by adding
+   `Content/Python/init_unreal.py` + `Saved/pickup_batch.json`: **one editor process, one Play session,
+   reset the scene in-place between cases** (teleport truck, restore pallet transform, lower lift, centre
+   steering) rather than ending/restarting Play. Batch results land in `Saved/AutoPickupBatch.txt`.
+   `AForkliftGameMode` gained `ReadAutoPickupCaseArgs`, `PlaceAutoPickupCase`, `PollAutoPickupRun`,
+   `FinishAutoPickupTest`, and an `EndPlay` override that un-forces the fixed timestep.
+
+**Latest 8-case batch result** (`Saved/AutoPickupBatch.txt`, 120 cm run-up unless noted):
+
+| Case | Result |
+|---|---|
+| square | PASS (rise 32.6 cm) |
+| yaw +8° | PASS |
+| yaw -8° | PASS |
+| offset +25 cm | PASS |
+| offset -25 cm | PASS |
+| offset -25, yaw +8° | **FAIL** — pockets lost during alignment |
+| offset +25, yaw -8° | **FAIL** — too close (gap -4, lateral 9.1, yaw -3.8) when insertion should've started |
+| yaw +15° (160 cm run-up) | **FAIL** — too close (lateral -23.5, yaw -7.1), didn't converge in time |
+
+Single-axis errors (yaw-only or offset-only, up to the tested magnitudes) pass cleanly now. Combined
+errors and larger single yaw (15°) still fail — the approach phase runs out of distance to converge, or
+loses the pockets outright, before insertion should start. **Not yet root-caused or fixed.**
+
+### Next steps (this thread)
+
+1. Fix the two/three failing combined-misalignment cases — likely needs either more approach distance,
+   a slower/more aggressive alignment gain at large errors, or widening the pocket-lock detection window.
+2. Write the Hybrid-A*/pure-pursuit planner and wire it to `AWarehouse::FindFreeSlot` — currently just a
+   design decision, no code.
+3. Regression-test that the insertion changes didn't reintroduce the old pallet-drag/slip bug from the
+   `ForkliftPalletTest` (not re-run this session).
+4. `unreal/` is still fully untracked in git — nothing from this session is committed either.
 
 ## What's running right now (check before assuming state)
 
-- **Detector server**: `python.exe` PID 17364 (may have exited since — check with
-  `curl http://127.0.0.1:8765/health`), serving `Saved/ml/runs/pallet_demo_v2/weights/best.pt`
-  (the current, tightened-box model). Start it yourself with:
+- **Detector server**: was started this session (`serve_detector.py`, port 8765) and was still healthy
+  (`curl http://127.0.0.1:8765/health`) as of this note — check, it may have exited since. Serves
+  `Saved/ml/runs/pallet_demo_v2/weights/best.pt`. Start it yourself with:
   ```
   %USERPROFILE%\.venvs\forklift-ml\Scripts\python.exe Scripts\ml\serve_detector.py
   ```
   (defaults now point at `pallet_demo_v2`, no flag needed).
-- **UnrealEditor.exe**: not running as of this note.
+- **UnrealEditor.exe**: not running as of this note (the batch-test editor session from this session has
+  since closed).
 - Nothing else backgrounded.
 
 ## Vehicle
@@ -31,17 +102,19 @@ pallets directly in the scene, it never needs the forklift to actually lift one.
 holds the mesh/wheel/tuning differences. **`EForkliftModel::ForkliftB` is the default now** (was C
 earlier this project). Force C with `-ForkliftModel=C` (e.g. for the regression self-test).
 
-**Known open bug, unfixed:** the scripted pallet pickup (`-ForkliftPalletTest`) reproducibly fails.
-The forks insert to a good depth (~113–116 cm) but the pallet skews 20–25° in yaw during entry, then
-doesn't rise with the lift and drags ~338 cm of slip when carried. Confirmed deterministic across
-repeated runs (same fixed-timestep numbers every time), so it's a real geometry/insertion issue, not
-noise. **This does not block the ML pipeline** — the synthetic generator places pallets directly in
-the scene for rendering/labeling, no physical pickup involved.
+**Pickup fix (2026-09-23):** the generated warehouse pallet asset was stale and still had one solid
+100x120x12 cm collision box, physically sealing the visible fork pockets. Re-running the existing
+`IMPORT_ONLY=pallet` path in `Scripts/import_assets.py` installed the intended five analytic boxes.
+The rendered `-ForkliftAutoPickupTest` now passes: the low camera detected both pockets, the controller
+aligned/inserted, and the physical pallet rose 32.6 cm. The generated `.uasset` and the import script both
+carry the hollow collision definition.
 
 ## Sensors
 
 - `UForkliftCameraComponent`: 640×480 @ 10 Hz, fixed exposure, optional aligned metric depth
   (`bCaptureDepth`, writes float16 `.npy`). Mounted on the fork carriage, rises/falls with the lift.
+- `TineCamera`: 640×480 RGB-D, 78° FOV, mounted low between the tines and hiding the forklift itself from
+  RGB/depth. Its synchronized frames feed `UForkliftAutoPickupComponent`.
 - `ULidarSensorComponent`: 16 channels × 360 steps, ±15° vertical, ray-traced (UE has no built-in
   lidar), mounted on the chassis (fixed, not on the moving lift).
 - `AForkliftHUD`: `V` toggles a debug overlay — fork camera thumbnail (now with live detection boxes
@@ -138,8 +211,8 @@ UnrealEditor.exe <uproject> /Game/Maps/Warehouse -game -windowed -ResX=320 -ResY
 
 ## Next steps / open decisions
 
-1. **Fix the physical pallet pickup** (see "known open bug" above) — needed before any real
-   automation, not needed for more detector work.
+1. Expand auto-pick validation beyond the square test pose: lateral/yaw offsets, loaded pallets, racks,
+   and recovery/back-out behavior after a safety abort.
 2. **Scale up training data** if pocket accuracy (weakest class, mAP50 0.80) needs to improve —
    current set is 3000 images; a remote A100 was discussed as an option (only data generation needs
    Windows/UE, `train_detector.py` is portable as-is — copy `images/`, `labels/`, `data.yaml`, fix the

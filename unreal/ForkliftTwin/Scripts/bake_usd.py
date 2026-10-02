@@ -46,6 +46,30 @@ WAREHOUSE_MATERIALS = {
     "M_GuardRail_A01_Body": dict(color=(0.95, 0.72, 0.05), roughness=0.5, metallic=0.1),
     "M_GuardRail_A01_Cap": dict(color=(0.10, 0.10, 0.11), roughness=0.6, metallic=0.0),
     "M_GuardRail_A01_Joints": dict(color=(0.45, 0.46, 0.48), roughness=0.4, metallic=1.0),
+    # Shell/lighting kit (from Isaac Sim's own Simple_Warehouse/warehouse.usd). Keyed by the exact bound
+    # material prim name (not the mesh's own name) since these meshes bind materials directly rather than
+    # through GeomSubsets. Colours are linear averages sampled from the real T_*_D.png / T_*_ORM.png
+    # textures (see the material's AlbedoTexture / MergeMapInput inputs) - not hand-picked like the rest
+    # of this dict - so they track NVIDIA's actual look instead of a guess.
+    "MI_WallA_01": dict(color=(0.472, 0.472, 0.472), roughness=0.40, metallic=0.0),   # SM_WallA_6M body
+    "MI_WallB_01": dict(color=(0.341, 0.345, 0.349), roughness=0.30, metallic=0.65),  # SM_CeilingA_6X6 (underside)
+    "MI_Floor_01": dict(color=(0.051, 0.050, 0.049), roughness=0.30, metallic=0.0),   # SM_floor02
+    "MI_BeamsA_01": dict(color=(0.124, 0.125, 0.120), roughness=0.48, metallic=0.06), # SM_BeamA_9M
+    "MI_BeamsA_02": dict(color=(0.124, 0.125, 0.120), roughness=0.48, metallic=0.06), # SM_WallA_6M trim
+    "MI_LampCeilingA": dict(color=(0.251, 0.247, 0.233), roughness=0.47, metallic=0.03),
+    "M_Glow": dict(color=(0.85, 0.85, 0.80), roughness=0.25, metallic=0.0),  # lamp lens; no source texture
+    # Real pallet-rack kit (SM_RackFrame_03 / SM_RackShelf_01 / SM_Rackshield_02) plus what stocks it.
+    # RackSetA_01's own D-texture samples as flat neutral grey (~0.42 sRGB) - the MDL shader's
+    # ColorAlbedo (0.488, 0.106, 0) is what actually paints the beam orange, so that one is srgb-decoded
+    # and used directly instead of the (colourless) texture average; every other entry here is a genuine
+    # sampled texture average, same method as the shell kit above.
+    "MI_RackSetA_01": dict(color=(0.195, 0.012, 0.0), roughness=0.40, metallic=0.03),   # RackShelf beam (orange)
+    "MI_RackSetB_01": dict(color=(0.138, 0.137, 0.134), roughness=0.49, metallic=0.0),  # RackFrame upright
+    "MI_RackSetC_01": dict(color=(0.132, 0.134, 0.134), roughness=0.32, metallic=0.0),  # RackFrame/RackShelf trim
+    "MI_RackSetD_01": dict(color=(0.269, 0.270, 0.270), roughness=0.21, metallic=0.0),  # RackShelf underside
+    "MI_RackShield_01": dict(color=(0.677, 0.316, 0.015), roughness=0.50, metallic=0.07),
+    "MI_PaletteSmallA_01": dict(color=(0.204, 0.146, 0.111), roughness=0.86, metallic=0.0),
+    "MI_CardBoxA": dict(color=(0.246, 0.166, 0.098), roughness=0.85, metallic=0.0),
 }
 FALLBACK_MATERIAL = dict(color=(0.6, 0.6, 0.6), roughness=0.6, metallic=0.0)
 
@@ -56,6 +80,20 @@ WAREHOUSE_ASSETS = [
     ("BlockPallet_A01_PR_NVD_01.usd", "BlockPallet_A01"),
     ("Bin_A06_30x51x19cm_PR_V_NVD_01.usd", "Bin_A06"),
     ("GuardRail_A01_01.usd", "GuardRail_A01"),
+    # Shell/lighting kit: real modular tiles instead of flat-colour boxes. See Warehouse.cpp for how
+    # they're tiled across the 36 x 24 m shell at the kit's true 9 m (3 x 3 m tier) wall height.
+    ("SM_WallA_6M.usd", "WallA_6M"),
+    ("SM_CeilingA_6X6.usd", "CeilingA_6X6"),
+    ("SM_floor02.usd", "Floor02"),
+    ("SM_LampCeilingA_04.usd", "LampCeilingA_04"),
+    ("SM_BeamA_9M.usd", "BeamA_9M"),
+    # Real modular pallet-rack kit + stock (replaces the DigitalTwin Rack_A01 for the main racking).
+    ("SM_RackFrame_03.usd", "RackFrame_03"),
+    ("SM_RackShelf_01.usd", "RackShelf_01"),
+    ("SM_Rackshield_02.usd", "Rackshield_02"),
+    ("SM_PaletteA_01.usd", "PaletteA_01"),
+    ("SM_CardBoxA_01.usd", "CardBoxA_01"),
+    ("SM_CardBoxA_02.usd", "CardBoxA_02"),
 ]
 
 # ---- Forklift: articulated parts -> output mesh names ---------------------------------------------

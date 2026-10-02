@@ -4,6 +4,7 @@ Run bake_usd.py first (Scripts/setup.py does the whole chain). This creates:
 
     /Game/Warehouse/Materials/M_FlatColor, M_FlatGlass and one MI_<slot> per material slot
     /Game/Warehouse/Meshes/SM_<Rack_A01|LoadedPallet_A04|BlockPallet_A01|Bin_A06|GuardRail_A01>
+    /Game/Warehouse/Meshes/SM_<WallA_6M|CeilingA_6X6|Floor02|LampCeilingA_04|BeamA_9M> (shell + lighting kit)
     /Game/Forklift/Meshes/SM_Forklift_<Body|Glass|Lift|FrontWheelL|...>
     /Game/ForkliftB/Meshes/SM_ForkliftB_<Body|Lift|DriveWheel|Swivel|RollerA..D>
 
@@ -267,6 +268,22 @@ def main():
         "BlockPallet_A01": "pallet_boxes",
         "Bin_A06": "box",
         "GuardRail_A01": "box",
+        # Shell/lighting kit: floor and walls need real collision (the forklift drives on/against them);
+        # the ceiling tile and beam are up at 9 m and the lamp hangs below that - nothing plays up there,
+        # so they're visual-only like Rack_A01.
+        "WallA_6M": "box",
+        "CeilingA_6X6": "box",
+        "Floor02": "box",
+        "LampCeilingA_04": None,
+        "BeamA_9M": None,
+        # Real rack kit: uprights/shelves/end-shields get collision (forklift and sensors interact with
+        # the rack run); the stock on the shelves is visual clutter like Rack_A01 was.
+        "RackFrame_03": "box",
+        "RackShelf_01": "box",
+        "Rackshield_02": "box",
+        "PaletteA_01": None,
+        "CardBoxA_01": None,
+        "CardBoxA_02": None,
     }
     for name, collision in warehouse.items():
         usd = os.path.join(BAKED, f"{name}.baked.usd")
